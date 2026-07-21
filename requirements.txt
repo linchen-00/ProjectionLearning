@@ -1,0 +1,15 @@
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+tqdm>=4.65
+Pillow>=9.5
+scikit-learn>=1.3
+# Optional (only required for the corresponding experiments):
+#   POT       — Wasserstein evaluation in 05_torus_256d.py
+#   gdown     — auto-download of the CapsNet checkpoint in 06_mnist_multiseed.py
+#               when capsnet_ckpt/ is absent
+POT>=0.9
+gdown>=4.7
+psutil>=5.9

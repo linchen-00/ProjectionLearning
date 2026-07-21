@@ -1,0 +1,418 @@
+"""Experiment 02: k-torus sample complexity across dimensions.
+
+What this experiment does
+-------------------------
+Part A:
+For each torus dimension ``d in {1, 2, 3, 4, 5}``, it works in ambient
+dimension ``2d`` with fixed ``delta = 1`` and searches for the smallest sample
+size ``n*`` such that MIE< 0.02.
+
+Part B:
+Using the ``n*`` values from Part A, it trains projection models for the same
+torus dimensions embedded in ``R^256`` and compares two noise scales:
+``delta = 1`` and ``delta = 16 / sqrt(d)``.
+
+Outputs save to ``trained_models/02_k_torus/``
+
+CLI
+---
+Run with:
+``python experiments/02_k_torus.py``
+
+Flag:
+``--force-train`` to ignore cached checkpoints and retrain from scratch
+"""
+
+import argparse
+import csv
+import gc
+import json
+import math
+from pathlib import Path
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+from projlearn.evaluation import dist_torus_embedded
+from projlearn.manifolds import torus, torus_embedded
+from projlearn.models import ProjectionNet
+from projlearn.sampling import tubular_nbh
+from projlearn.training import train_projection_algorithm1
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+_ROOT = Path(__file__).resolve().parent.parent
+MODEL_DIR = _ROOT / "trained_models" / "02_k_torus"
+
+# ── Device ───────────────────────────────────────────────────────────────────
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
+print(f"Using device: {device}")
+
+# ── Experiment parameters ────────────────────────────────────────────────────
+D_VECTOR = [1, 2, 3, 4, 5]
+MIE_THRESHOLD = 0.02
+GROWTH_FACTOR = 1.2
+NSTEP = 30
+MAX_MULT = 50
+ITER_PRETRAIN = 500
+ITER_PROJECT = 1500
+LR = 1e-3
+BATCH_SIZE = 512
+NUM_NOISY = 100
+
+# ── Plot style ───────────────────────────────────────────────────────────────
+mpl.rcParams.update({
+    "font.family":     "serif",
+    "font.size":       12,
+    "axes.labelsize":  15,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 12,
+    "lines.linewidth": 1.8,
+    "lines.markersize": 7,
+})
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+def parse_args():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--force-train", action="store_true",
+                    help="Retrain from scratch even if checkpoints exist.")
+    return ap.parse_args()
+
+
+# ── Training helper ───────────────────────────────────────────────────────────
+def train_torus_model(n, delta, ambient_dim, sampler=None, use_dataloader=False):
+    """Train a ProjectionNet on a torus manifold and return (samples, manifold, model)."""
+    torch.manual_seed(3)
+    samples = sampler(n) if sampler is not None else torus(
+        n, ambient_dim=ambient_dim)
+    model = ProjectionNet(ambient_dim).to(device)
+
+    train_projection_algorithm1(
+        model, samples, delta,
+        n_pretrain=ITER_PRETRAIN, n_project=ITER_PROJECT,
+        lr_pretrain=5e-3, lr_project=LR,
+        num_noisy=NUM_NOISY, r_inner=delta / 2,
+        loss_pretrain={"C1": 1, "C3": 1},
+        loss_project={"C1": 1, "C2": 0.5, "C3": 0.5},
+        scheduler_pretrain="constant", scheduler_project="constant",
+        batch_size=BATCH_SIZE, use_dataloader=use_dataloader,
+        show_progress=True, verbose=False, device=device,
+    )
+
+    M_delta = tubular_nbh(samples, delta, ambient_dim,
+                          num_points_per_sample=NUM_NOISY)
+    model_cpu = model.cpu()
+    with torch.no_grad():
+        manifold = model_cpu(model_cpu(M_delta))
+    return samples.cpu(), manifold.cpu(), model_cpu
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART A — minimal n* search
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_partA(force_train: bool):
+    print("\n" + "=" * 70)
+    print("PART A — n* search, delta=1, ambient=2d")
+    print("=" * 70)
+    print(f"Using device: {device}")
+
+    checkpoint_path = MODEL_DIR / "checkpoint.pt"
+
+    # ── Load path ─────────────────────────────────────────────────────────────
+    if checkpoint_path.exists() and not force_train:
+        ckpt = torch.load(checkpoint_path, map_location="cpu",
+                          weights_only=False)
+        results_min_n = ckpt["results_min_n"]
+        all_trials = ckpt["all_trials"]
+        completed_d = ckpt["completed_d"]
+        next_start_n = ckpt["next_start_n"]
+        print(f"Loaded checkpoint from {checkpoint_path.relative_to(_ROOT)}")
+
+        missing = [d for d in D_VECTOR if d not in completed_d]
+        if not missing:
+            print(f"  All dimensions completed: {completed_d}")
+            print(f"  n* values: {results_min_n}")
+            return results_min_n, all_trials
+    else:
+        results_min_n = []
+        all_trials = []
+        completed_d = []
+        next_start_n = NSTEP
+        if force_train:
+            print("--force-train: starting Part A from scratch")
+
+    # ── Train loop ────────────────────────────────────────────────────────────
+    for d in D_VECTOR:
+        if d in completed_d:
+            print(f"\n[d={d}] already completed, skipping")
+            continue
+
+        ambient_dim = 2 * d
+        delta_d = 1
+        n = max(next_start_n, NSTEP)
+        found = None
+
+        print(f"\n[d={d}] delta={delta_d} (fixed), ambient={ambient_dim}, "
+              f"starting at n={n}")
+
+        for attempt in range(MAX_MULT):
+            use_dl = ambient_dim >= 8
+            samples, manifold, model = train_torus_model(
+                n, delta_d, ambient_dim, use_dataloader=use_dl)
+            mie_val, is_good = dist_torus_embedded(
+                manifold, torus_dim=d, ambient_dim=ambient_dim,
+                threshold=MIE_THRESHOLD)
+            all_trials.append((d, n, mie_val))
+            print(f"  attempt {attempt+1}: n={n}  MIE={mie_val:.6f}  "
+                  f"{'PASS' if is_good else 'FAIL'}")
+
+            if is_good:
+                found = n
+                torch.save(model.state_dict(),
+                           MODEL_DIR / f"torus_d{d}.pt")
+                del samples, manifold, model
+                break
+
+            n = max(n + NSTEP, int(math.ceil(n * GROWTH_FACTOR)))
+            del samples, manifold, model
+            gc.collect()
+
+        results_min_n.append(found)
+        next_start_n = found if found is not None else n
+        completed_d.append(d)
+        print(f"  => min n = {found}")
+
+        torch.save({
+            "results_min_n": results_min_n,
+            "all_trials":    all_trials,
+            "next_start_n":  next_start_n,
+            "completed_d":   completed_d,
+        }, checkpoint_path)
+        print(f"  Checkpoint saved "
+              f"({len(completed_d)}/{len(D_VECTOR)} dims done)")
+
+    print(f"\nPart A complete — n* values: {results_min_n}")
+    return results_min_n, all_trials
+
+
+def plot_partA(results_min_n: list, all_trials: list) -> None:
+    """Produce k_torus_n_vs_dim_mie.png and save trial_data.csv."""
+    d_arr = np.array(D_VECTOR, dtype=float)
+    n_vals = np.array(
+        [v if v is not None else np.nan for v in results_min_n], dtype=float)
+    mask = np.isfinite(n_vals)
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.semilogy(d_arr[mask], n_vals[mask], "o-", color="#1f77b4",
+                label=rf"$\mathrm{{MIE}} \leq {MIE_THRESHOLD}$")
+
+    if mask.sum() >= 2:
+        C_fit, b_fit = np.polyfit(d_arr[mask], np.log(n_vals[mask]), 1)
+        x_ref = np.linspace(d_arr[mask].min(), d_arr[mask].max(), 200)
+        y_ref = np.exp(b_fit + np.log(2)) * np.exp(C_fit * x_ref)
+        ax.semilogy(x_ref, y_ref, "--", color="#c0392b",
+                    label=rf"$n \propto \exp({C_fit:.2f}\,d)$")
+
+    ax.set_xlabel(r"Intrinsic dimension $d$")
+    ax.set_ylabel(r"Number of training samples $n$")
+    ax.set_xticks(D_VECTOR)
+    ax.grid(True, which="major", linestyle="--", alpha=0.4)
+    ax.legend(frameon=False)
+    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.10, top=0.96)
+
+    out = MODEL_DIR / "k_torus_n_vs_dim_mie.png"
+    fig.savefig(out, dpi=600)
+    plt.close(fig)
+    print(f"Saved {out.relative_to(_ROOT)}")
+
+    # Trial data CSV
+    csv_path = MODEL_DIR / "trial_data.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["d", "n", "mie"])
+        w.writerows(all_trials)
+    print(f"Saved {csv_path.relative_to(_ROOT)}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART B — ambient-256 comparison
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_partB(results_min_n: list, force_train: bool) -> dict:
+    print("\n" + "=" * 70)
+    print("PART B — ambient-256: delta=1 vs delta=16/sqrt(d)")
+    print("=" * 70)
+
+    ambient_256 = 256
+    partb_ckpt_path = MODEL_DIR / "partb_checkpoint.pt"
+
+    # ── Load path ─────────────────────────────────────────────────────────────
+    if partb_ckpt_path.exists() and not force_train:
+        ckpt = torch.load(partb_ckpt_path, map_location="cpu",
+                          weights_only=False)
+        partb_results = ckpt["partb_results"]
+        partb_completed = ckpt["partb_completed_d"]
+        print(f"Loaded checkpoint from {partb_ckpt_path.relative_to(_ROOT)}")
+
+        missing = [d for d in D_VECTOR if d not in partb_completed]
+        if not missing:
+            _print_partB_table(partb_results, results_min_n)
+            _save_partB_artifacts(partb_results)
+            return partb_results
+    else:
+        partb_results = {}
+        partb_completed = []
+        if force_train:
+            print("--force-train: starting Part B from scratch")
+
+    # ── Train loop ────────────────────────────────────────────────────────────
+    def make_sampler(torus_d, amb):
+        def sampler(n):
+            return torus_embedded(n, torus_dim=torus_d, ambient_dim=amb)
+        return sampler
+
+    for i, d in enumerate(D_VECTOR):
+        n_star = results_min_n[i]
+        if n_star is None:
+            print(f"\n[Part B d={d}] No n* from Part A, skipping.")
+            continue
+        if d in partb_completed:
+            r = partb_results[d]
+            print(f"\n[Part B d={d}] already completed — "
+                  f"delta=1 amb MIE={r['delta1_amb_mie']:.6f}, "
+                  f"delta=scaled amb MIE={r['delta_scaled_amb_mie']:.6f}")
+            continue
+
+        sampler_256 = make_sampler(d, ambient_256)
+        delta_scaled = 16.0 / math.sqrt(d)
+        print(f"\n[Part B d={d}] n*={n_star}, ambient=256")
+
+        # ── delta = 1 ─────────────────────────────────────────────────────────
+        print("  Training delta=1 ...")
+        _, manifold_1, _ = train_torus_model(
+            n_star, 1.0, ambient_256, sampler=sampler_256, use_dataloader=True)
+        d1_amb_mie, d1_amb_pass = dist_torus_embedded(
+            manifold_1, torus_dim=d, ambient_dim=ambient_256,
+            threshold=MIE_THRESHOLD)
+        d1_emb_mie, _ = dist_torus_embedded(
+            manifold_1[:, :2*d], torus_dim=d, ambient_dim=2*d,
+            threshold=MIE_THRESHOLD)
+        print(f"    amb MIE={d1_amb_mie:.6f} ({'PASS' if d1_amb_pass else 'FAIL'}), "
+              f"emb MIE={d1_emb_mie:.6f}")
+        del manifold_1
+        gc.collect()
+
+        # ── delta = 16/sqrt(d) ────────────────────────────────────────────────
+        print(f"  Training delta=16/sqrt({d})={delta_scaled:.4f} ...")
+        _, manifold_2, _ = train_torus_model(
+            n_star, delta_scaled, ambient_256,
+            sampler=sampler_256, use_dataloader=True)
+        ds_amb_mie, ds_amb_pass = dist_torus_embedded(
+            manifold_2, torus_dim=d, ambient_dim=ambient_256,
+            threshold=MIE_THRESHOLD)
+        ds_emb_mie, _ = dist_torus_embedded(
+            manifold_2[:, :2*d], torus_dim=d, ambient_dim=2*d,
+            threshold=MIE_THRESHOLD)
+        print(f"    amb MIE={ds_amb_mie:.6f} ({'PASS' if ds_amb_pass else 'FAIL'}), "
+              f"emb MIE={ds_emb_mie:.6f}")
+        del manifold_2
+        gc.collect()
+
+        partb_results[d] = {
+            "n_star":                n_star,
+            "delta1":                1.0,
+            "delta1_amb_mie":        d1_amb_mie,
+            "delta1_emb_mie":        d1_emb_mie,
+            "delta1_amb_pass":       bool(d1_amb_pass),
+            "delta_scaled":          delta_scaled,
+            "delta_scaled_amb_mie":  ds_amb_mie,
+            "delta_scaled_emb_mie":  ds_emb_mie,
+            "delta_scaled_amb_pass": bool(ds_amb_pass),
+        }
+        partb_completed.append(d)
+
+        torch.save({
+            "partb_results":     partb_results,
+            "partb_completed_d": partb_completed,
+        }, partb_ckpt_path)
+        print(f"  Part B checkpoint saved "
+              f"({len(partb_completed)}/{len(D_VECTOR)} dims done)")
+
+    _print_partB_table(partb_results, results_min_n)
+    _save_partB_artifacts(partb_results)
+
+
+def _print_partB_table(partb_results: dict, results_min_n: list) -> None:
+    print(f"\n{'d':>3} {'n*':>6} {'delta_sc':>9}  "
+          f"{'amb_MIE(d=1)':>13} {'emb_MIE(d=1)':>13}  "
+          f"{'amb_MIE(sc)':>12} {'emb_MIE(sc)':>12}")
+    print("-" * 80)
+    for i, d in enumerate(D_VECTOR):
+        if d not in partb_results:
+            continue
+        r = partb_results[d]
+        print(f"  {d:>1}  {results_min_n[i]:>6}  {r['delta_scaled']:>9.4f}  "
+              f"  {r['delta1_amb_mie']:>11.6f}  {r['delta1_emb_mie']:>11.6f}  "
+              f"  {r['delta_scaled_amb_mie']:>10.6f}  {r['delta_scaled_emb_mie']:>10.6f}")
+
+
+def _save_partB_artifacts(partb_results: dict) -> None:
+    json_path = MODEL_DIR / "partb_results.json"
+    with open(json_path, "w") as f:
+        json.dump({str(d): partb_results[d]
+                  for d in partb_results}, f, indent=2)
+    print(f"\nSaved {json_path.relative_to(_ROOT)}")
+
+    header = ["d", "n_star", "delta1",
+              "delta1_amb_mie", "delta1_emb_mie", "delta1_amb_pass",
+              "delta_scaled",
+              "delta_scaled_amb_mie", "delta_scaled_emb_mie", "delta_scaled_amb_pass"]
+    rows = []
+    for d in D_VECTOR:
+        if d not in partb_results:
+            continue
+        r = partb_results[d]
+        rows.append([d, r["n_star"], r["delta1"],
+                     r["delta1_amb_mie"], r["delta1_emb_mie"], r["delta1_amb_pass"],
+                     r["delta_scaled"],
+                     r["delta_scaled_amb_mie"], r["delta_scaled_emb_mie"],
+                     r["delta_scaled_amb_pass"]])
+    csv_path = MODEL_DIR / "partb_results.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    print(f"Saved {csv_path.relative_to(_ROOT)}")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Main
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def main():
+    args = parse_args()
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    results_min_n, all_trials = run_partA(args.force_train)
+    plot_partA(results_min_n, all_trials)
+
+    run_partB(results_min_n, args.force_train)
+
+    print("\n" + "=" * 70)
+    print("Experiment complete.")
+    print(f"  Part A n* values : {results_min_n}")
+    print(f"  Outputs in       : {MODEL_DIR.relative_to(_ROOT)}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
