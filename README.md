@@ -1,4 +1,4 @@
-# Paper Supplement — Projection Learning on Manifolds
+# Projection Learning on Manifolds
 
 This repository contains the supplementary source code for the paper:
 experiment scripts, the projection-learning library (`src/projlearn/`), a
@@ -11,11 +11,13 @@ environment.
 Generated models and experimental outputs can be recreated locally by running
 the corresponding experiment scripts. Datasets and external evaluation
 dependencies may require separate downloading or setup as described below.
+Pretrained model artifacts are available separately from Google Drive:
+<https://drive.google.com/drive/folders/1BBvd7rodzt04CBB1fjHc0RHlpFsGWHMQ?usp=sharing>.
 
 ## 1. Folder layout
 
 ```
-paper_supplement_final/
+ProjectionLearning/
 ├── README.md
 ├── requirements.txt
 ├── pyproject.toml
@@ -43,7 +45,7 @@ or clone those caches when they are absent.  All experiments use file-relative p
 - Create a fresh virtual environment and install requirements:
 
 ```bash
-cd paper_supplement_final
+cd ProjectionLearning
 python -m venv .venv   (or python3 -m venv .venv)
 source .venv/bin/activate
 pip install --upgrade pip
@@ -71,11 +73,11 @@ invocations work and resolve `projlearn` to the installed
 
 ```bash
 # (a) from the supplement root (recommended)
-cd paper_supplement_final
+cd ProjectionLearning
 python experiments/01_2d_circle.py
 
 # (b) from inside experiments/ — also works
-cd paper_supplement_final/experiments
+cd ProjectionLearning/experiments
 python 01_2d_circle.py
 ```
 
