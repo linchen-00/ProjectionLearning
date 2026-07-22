@@ -38,6 +38,7 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
+Tutorial_on_ManifoldProjection.ipynb
 
 # Trained models and checkpoints
 trained_models/
@@ -61,4 +62,3 @@ figures/
 logs/
 wandb/
 mlruns/
-
