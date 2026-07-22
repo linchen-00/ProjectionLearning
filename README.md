@@ -1,6 +1,4 @@
-# Projection Learning on Manifolds
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1MiDFBP05REl0mNaKOWu8JP0Ufr97qbms?usp=sharing)
+# Projection Learning on Manifolds [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1MiDFBP05REl0mNaKOWu8JP0Ufr97qbms?usp=sharing)
 
 Projection learning trains maps that project noisy ambient samples back onto low-dimensional data manifolds. This repository builds a PyTorch library for projection models, together with experiment scripts for synthetic manifolds, image-valued manifolds, and MNIST.
 
@@ -14,7 +12,7 @@ The repository contains:
   experiment-running utilities.
 
 For a guided introduction and an interactive playground, open the
-[Google Colab tutorial](https://colab.research.google.com/drive/1MiDFBP05REl0mNaKOWu8JP0Ufr97qbms?usp=sharing).
+[Google Colab Tutorial](https://colab.research.google.com/drive/1MiDFBP05REl0mNaKOWu8JP0Ufr97qbms?usp=sharing).
 
 ## 1. Code Structure
 
