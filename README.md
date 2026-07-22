@@ -2,18 +2,14 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1MiDFBP05REl0mNaKOWu8JP0Ufr97qbms?usp=sharing)
 
-Projection learning trains maps that project noisy ambient samples back
-onto low-dimensional data manifolds. This repository builds a small PyTorch
-library for projection models, together with experiment scripts for synthetic
-manifolds, image-valued manifolds, and MNIST.
+Projection learning trains maps that project noisy ambient samples back onto low-dimensional data manifolds. This repository builds a PyTorch library for projection models, together with experiment scripts for synthetic manifolds, image-valued manifolds, and MNIST.
 
 The repository contains:
 
 - `src/projlearn/`: reusable projection-learning components, including
   manifolds, models, losses, training loops, sampling, evaluation, and
   visualization utilities.
-- `experiments/`: scripts for the circle, torus, image-manifold, torus-union,
-  high-dimensional torus, and MNIST experiments.
+- `experiments/`: scripts for the circle, torus, image-manifold, torus-union, high-dimensional torus, and MNIST experiments.
 - `requirements.txt`, `pyproject.toml`, and `run_all.sh`: installation and
   experiment-running utilities.
 
@@ -38,8 +34,7 @@ ProjectionLearning/
 └── run_all.sh
 ```
 
-Generated checkpoints, cached metrics, figures, and reports are written under
-`trained_models/` during local runs. That directory is ignored by Git.
+Generated checkpoints, cached metrics, figures, and reports are written under `trained_models/` during local runs. That directory is ignored by Git.
 
 ## 2. Installation
 
@@ -49,7 +44,7 @@ Python 3.10 or later is recommended.
 git clone https://github.com/linchen-00/ProjectionLearning.git
 cd ProjectionLearning
 
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 
 pip install --upgrade pip
@@ -57,13 +52,10 @@ pip install -r requirements.txt
 pip install .
 ```
 
-If your system uses `python3` instead of `python`, replace the command
-accordingly.
 
 ## 3. Pretrained Models
 
-Pretrained models and generated experiment artifacts are not tracked in Git.
-They can be downloaded from
+Pretrained models and generated experiment results are not available in Git. They can be downloaded from
 [Google Drive](https://drive.google.com/drive/folders/1BBvd7rodzt04CBB1fjHc0RHlpFsGWHMQ?usp=sharing).
 
 Place the downloaded `trained_models/` directory at the repository root:
@@ -81,30 +73,23 @@ After installing the package and downloading `trained_models/`, run an
 experiment script from the repository root. For example:
 
 ```bash
-python experiments/01_2d_circle.py --no-show
+python3 experiments/01_2d_circle.py
 ```
 
-Most scripts reuse cached checkpoints or metrics when they are present and
-regenerate missing artifacts locally when needed.
+Most scripts reuse cached checkpoints or metrics when they are present and regenerate missing results locally when needed.
 
 ### Train From Scratch
 
 To retrain a single experiment, use the corresponding force flag. For example:
 
 ```bash
-python experiments/01_2d_circle.py --force-retrain --no-show
+python3 experiments/01_2d_circle.py --force-retrain
 ```
 
 To rerun every experiment in sequence:
 
 ```bash
 bash run_all.sh
-```
-
-For headless servers:
-
-```bash
-MPLBACKEND=Agg bash run_all.sh
 ```
 
 ### Build a New Projection Experiment
@@ -118,29 +103,36 @@ from projlearn.manifolds import circle_2d
 from projlearn.models import ProjectionNet
 from projlearn.training import train_projection_algorithm1
 
-samples = circle_2d(N=128, ambient_dim=2)
+samples = circle_2d(N=50, ambient_dim=2)
 model = ProjectionNet(ambient_dim=2)
 
 train_projection_algorithm1(
     model,
     samples,
     delta=0.5,
-    n_pretrain=200,
-    n_project=800,
+    n_pretrain=300,
+    n_project=1000,
     lr_pretrain=5e-3,
     lr_project=1e-3,
-    num_noisy=100,
+    num_noisy=50,
     r_inner=0.25,
 )
 
 with torch.no_grad():
     noisy_samples = samples + 0.5 * torch.randn_like(samples)
-    projected_samples = model(noisy_samples)
+    projected_once = model(noisy_samples)    # apply the projection map once
+    projected_twice = model(projected_once)  # apply the projection map twice
 ```
 
-Use the experiment scripts as templates for larger studies, custom manifolds,
-multi-stage projection maps, and comparisons with diffusion baselines.
+The second application is optional, but it can further refine samples because a composition of projection maps can still be used as a projection map.
 
-## 5. Citation
+## 5. Practical Guidance
+
+- Algorithm 1 trains a projection map at a single noise radius. It is a good default for low-dimensional manifolds and simple experiments.
+- For models trained with Algorithm 1, applying the learned projection map a small number of times can improve sampling quality.
+- Algorithm 2 trains projection maps across decreasing noise radii, giving a coarse-to-fine projection procedure. It is recommended for high-dimensional data such as images.
+- If the C2 Jacobian-vector penalty is expensive, use `c2_mode="fd"` for a finite-difference approximation. Use `c2_mode="exact"` when you want the exact Jacobian-vector product used in the objective.
+
+## 6. Citation
 
 Coming soon.
