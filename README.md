@@ -114,6 +114,7 @@ train_projection_algorithm1(
     lr_project=1e-3,
     num_noisy=50,
     r_inner=0.25,
+    c2_mode="exact",
 )
 
 with torch.no_grad():
@@ -129,7 +130,7 @@ The second application is optional, but it can further refine samples because a 
 - Algorithm 1 trains a projection map at a single noise radius. It is a good default for low-dimensional manifolds and simple experiments.
 - For models trained with Algorithm 1, applying the learned projection map a small number of times can improve sampling quality.
 - Algorithm 2 trains projection maps across decreasing noise radii, giving a coarse-to-fine projection procedure. It is recommended for high-dimensional data such as images.
-- If the C2 Jacobian-vector penalty is expensive, use `c2_mode="fd"` for a finite-difference approximation. Use `c2_mode="exact"` when you want the exact Jacobian-vector product used in the objective.
+- If the Jacobian-vector penalty in the objective is expensive, use `c2_mode="fd"` for a finite-difference approximation. Use `c2_mode="exact"` when you want the exact Jacobian-vector product.
 
 ## 6. Citation
 
