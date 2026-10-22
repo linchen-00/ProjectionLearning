@@ -54,9 +54,9 @@ from projlearn.utils import second_neighbor_stats
 from projlearn.visualization import plot_3d, plot_3d_with_lines
 
 
-ROOT = Path(__file__).resolve().parent.parent
-SAVE_DIR = ROOT / "trained_models" / "05_torus_256d"
-WASSERSTEIN_METRICS = [
+root = Path(__file__).resolve().parent.parent
+save_root = root / "trained_models" / "05_torus_256d"
+wasserstein_metrics = [
     "W(orig,orig)",
     "W(true,true)",
     "W(gen,true)",
@@ -70,11 +70,12 @@ def parse_args():
     parser.add_argument("--force-retrain", action="store_true")
     parser.add_argument("--seeds", nargs="+", type=int,
                         default=[2, 3, 4, 5, 6])
-    parser.add_argument("--n-pretrain", type=int, default=400)
-    parser.add_argument("--n-projection", type=int, default=2000)
-    parser.add_argument("--lr-pretrain", type=float, default=5e-3)
-    parser.add_argument("--lr-projection", type=float, default=1e-3)
-    parser.add_argument("--r-inner", type=float, default=1.75)
+    # Fixed schedule tuned for adaptive C2 at r_inner=0.7.
+    parser.add_argument("--n-pretrain", type=int, default=1000)
+    parser.add_argument("--n-projection", type=int, default=4000)
+    parser.add_argument("--lr-pretrain", type=float, default=2e-3)
+    parser.add_argument("--lr-projection", type=float, default=3e-4)
+    parser.add_argument("--r-inner", type=float, default=0.7)
     parser.add_argument("--applications", type=int, default=4)
     parser.add_argument(
         "--run-tag", default="",
@@ -99,7 +100,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    save_dir = SAVE_DIR / args.run_tag if args.run_tag else SAVE_DIR
+    save_dir = save_root / args.run_tag if args.run_tag else save_root
     save_dir.mkdir(parents=True, exist_ok=True)
     output_path = save_dir / "output.txt"
     device = ("cuda" if torch.cuda.is_available()
@@ -107,7 +108,7 @@ def main():
               else "cpu")
 
     common_params = {
-        "N": 480,
+        "n_samples": 480,
         "delta": 7,
         "r_inner": args.r_inner,
         "torus_dim": 2,
@@ -144,12 +145,14 @@ def main():
             )
             samples = checkpoint["samples"]
             model = checkpoint["model_final"].to(device).eval()
-            params = checkpoint["params"]
+            params = dict(checkpoint["params"])
+            if "N" in params:  # Historical checkpoint metadata.
+                params["n_samples"] = params.pop("N")
             print(f"Loaded checkpoint: {checkpoint_path}")
         else:
             torch.manual_seed(seed)
             samples = torus_embedded(
-                params["N"], torus_dim=params["torus_dim"],
+                params['n_samples'], torus_dim=params["torus_dim"],
                 ambient_dim=params["ambient_dim"], density_params=[0.0, 0.5],
             )
             avg_2nn, max_2nn = second_neighbor_stats(samples)
@@ -366,12 +369,12 @@ def add_wasserstein_summary(wass_data, lines):
                 f"  Seed {seed}: "
                 + "  ".join(
                     f"{name}={float(row[name]):.6f}"
-                    for name in WASSERSTEIN_METRICS
+                    for name in wasserstein_metrics
                 )
             )
 
         emit("\nWasserstein averages:")
-        for name in WASSERSTEIN_METRICS:
+        for name in wasserstein_metrics:
             key = f"Avg {name}"
             value = summary.get(key)
             if value is None:
@@ -483,7 +486,7 @@ def compute_wasserstein_per_seed(sets, seeds):
         f"Avg {name}": float(
             np.mean([per_seed_results[seed][name] for seed in seeds])
         )
-        for name in WASSERSTEIN_METRICS
+        for name in wasserstein_metrics
     }
     return results_W, per_seed_results, summary
 

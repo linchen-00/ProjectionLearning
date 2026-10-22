@@ -57,27 +57,27 @@ def main():
 
     # Single-radius comparison. Geometry and sample counts match Experiment 04.
     params = {
-        "N1": 600,
-        "N2": 100,
-        "R1": 1.0,
-        "R2": 0.4,
-        "Rc": 1.0,
+        "n_torus": 600,
+        "n_circle": 100,
+        "r_major": 1.0,
+        "r_minor": 0.4,
+        "r_circle": 1.0,
         "ambient_dim": 3,
         "delta": 0.25,
-        "num_points_per_samples": 10,
-        "num_points_per_sample_viz": 50,
+        "num_noisy": 10,
+        "num_noisy_generation": 50,
         "lr_pretrain": 6e-3,
         "lr_projection": 1e-3,
         "n_pretrain": 3000,
         "n_projection": 2000,
         "num_projection_applications": 4,
-        "loss1": {"C1": 1.0, "C3": 1.0},
-        "loss2": {"C1": 1.0, "C2": 1.0, "C3": 1.0},
+        "loss_pretrain": {"C1": 1.0, "C3": 1.0},
+        "loss_projection": {"C1": 1.0, "C2": 1.0, "C3": 1.0},
     }
     params["r_inner"] = params["delta"] / 2
 
-    _ROOT = Path(__file__).resolve().parent.parent
-    save_dir = _ROOT / "trained_models" / "04_torus_circle_union"
+    root = Path(__file__).resolve().parent.parent
+    save_dir = root / "trained_models" / "04_torus_circle_union"
     save_dir.mkdir(parents=True, exist_ok=True)
 
     seed = 2
@@ -97,14 +97,14 @@ def distance_to_union(points, params):
     """Exact pointwise distance to the torus-circle union."""
     rho = torch.linalg.norm(points[:, :2], dim=1)
     d_torus = (
-        torch.sqrt((rho - params["R1"]) ** 2 + points[:, 2] ** 2)
-        - params["R2"]
+        torch.sqrt((rho - params['r_major']) ** 2 + points[:, 2] ** 2)
+        - params['r_minor']
     ).abs()
     circle_radial = torch.sqrt(
-        (points[:, 0] - params["Rc"]) ** 2 + points[:, 2] ** 2
+        (points[:, 0] - params['r_circle']) ** 2 + points[:, 2] ** 2
     )
     d_circle = torch.sqrt(
-        (circle_radial - params["Rc"]) ** 2 + points[:, 1] ** 2
+        (circle_radial - params['r_circle']) ** 2 + points[:, 1] ** 2
     )
     return torch.minimum(d_torus, d_circle)
 
@@ -124,10 +124,10 @@ def train_torus_circle_model(model, samples, params):
         n_project=params["n_projection"],
         lr_pretrain=params["lr_pretrain"],
         lr_project=params["lr_projection"],
-        num_noisy=params["num_points_per_samples"],
+        num_noisy=params['num_noisy'],
         r_inner=params["r_inner"],
-        loss_pretrain=params["loss1"],
-        loss_project=params["loss2"],
+        loss_pretrain=params['loss_pretrain'],
+        loss_project=params['loss_projection'],
         scheduler_pretrain="constant", scheduler_project="cosine",
         print_every=100, device=device,
     )
@@ -316,17 +316,25 @@ def run_one_experiment(seed, base_params, save_dir, force_retrain=False):
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         # Merge checkpoint params over current defaults so new keys from main
-        # (such as num_points_per_sample_viz) are retained.
+        # (such as num_noisy_generation) are retained.
         ckpt_params = ckpt.get("params", {})
         if ckpt_params is None:
             ckpt_params = {}
+        # Normalize historical metadata without changing the saved file.
+        legacy_keys = {"N1": "n_torus", "N2": "n_circle", "R1": "r_major",
+                       "R2": "r_minor", "Rc": "r_circle", "N": "n_samples",
+                       "num_points_per_samples": "num_noisy",
+                       "num_points_per_sample_viz": "num_noisy_generation",
+                       "loss1": "loss_pretrain", "loss2": "loss_projection"}
+        ckpt_params = {legacy_keys.get(key, key): value
+                       for key, value in ckpt_params.items()}
         params = {**params, **ckpt_params}
         samples = ckpt["samples"].cpu()
         model = ProjectionNet(params["ambient_dim"]).cpu()
         model.load_state_dict(ckpt["model_final"])
 
         # Recompute samples so current visualization density is respected.
-        viz_npps = params["num_points_per_sample_viz"]
+        viz_npps = params['num_noisy_generation']
         M_delta = tubular_nbh(
             samples,
             params["delta"],
@@ -344,17 +352,17 @@ def run_one_experiment(seed, base_params, save_dir, force_retrain=False):
         return samples, manifold
 
     # Data
-    N = params["N1"] + params["N2"]
-    params["N"] = N
+    n_samples = params['n_torus'] + params['n_circle']
+    params['n_samples'] = n_samples
     samples = torus_and_circle_3d(
-        N1=params["N1"], N2=params["N2"],
-        R1=params["R1"], R2=params["R2"], Rc=params["Rc"]
+        N1=params['n_torus'], N2=params['n_circle'],
+        R1=params['r_major'], R2=params['r_minor'], Rc=params['r_circle']
     )
     avg_2nn, max_2nn = second_neighbor_stats(samples)
 
     print(
-        f"Torus+Circle: N1={params['N1']}, N2={params['N2']}, "
-        f"N={N}, ambient_dim={params['ambient_dim']}, delta={params['delta']}"
+        f"Torus+Circle: N1={params['n_torus']}, N2={params['n_circle']}, "
+        f"N={n_samples}, ambient_dim={params['ambient_dim']}, delta={params['delta']}"
     )
     print(f"Average distance to 2nd nearest neighbor: {avg_2nn:.4f}")
     print(f"Maximum distance to 2nd nearest neighbor: {max_2nn:.4f}")
@@ -364,7 +372,7 @@ def run_one_experiment(seed, base_params, save_dir, force_retrain=False):
     model = train_torus_circle_model(model, samples, params)
 
     # Generate manifold samples for plotting (matches notebook expression)
-    viz_npps = params["num_points_per_sample_viz"]
+    viz_npps = params['num_noisy_generation']
     M_delta = tubular_nbh(
         samples,
         params["delta"],

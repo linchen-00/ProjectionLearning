@@ -55,31 +55,31 @@ data_seed = 2
 train_seed = 30
 eval_seed = 123
 
-N = 40
+n_samples = 40
 delta = 0.7
 ambient_dim = 2
-num_points_per_samples = 250
+num_noisy = 250
 
 # Projection training (two-phase, cosine schedule each)
-proj_phase1_epochs = 500
-proj_phase2_epochs = 2500
-proj_lr1 = 6e-3
-proj_lr2 = 1e-3
+n_pretrain = 500
+n_projection = 2500
+lr_pretrain = 6e-3
+lr_projection = 1e-3
 
 # Diffusion training
-diffusion_sigma = 25
-diffusion_train_epochs = 10000
-diffusion_train_M = 100
-diffusion_train_lr = 1e-3
+sigma = 25
+n_diffusion = 10000
+diffusion_time_samples = 100
+lr_diffusion = 1e-3
 
 # Diffusion sampling for plots
-diffusion_batch_size = 1000
+num_generated = 1000
 diffusion_num_steps = 10000
 diffusion_eps = 1e-6
 desired_times = [1e-3, 1e-6]
 
-_ROOT = Path(__file__).resolve().parent.parent
-model_dir = _ROOT / "trained_models" / "01_2d_circle"
+root = Path(__file__).resolve().parent.parent
+model_dir = root / "trained_models" / "01_2d_circle"
 output_dir = model_dir
 model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -89,7 +89,7 @@ diffusion_ckpt = model_dir / "diffusion_model.pt"
 
 # ── Data ────────────────────────────────────────────────────────────────────
 torch.manual_seed(data_seed)
-samples = circle_2d(N, ambient_dim=ambient_dim)
+samples = circle_2d(n_samples, ambient_dim=ambient_dim)
 
 
 plt.rcParams.update({
@@ -109,9 +109,9 @@ def train_projection_model():
     model = ProjectionNet(ambient_dim).to(device)
     train_projection_algorithm1(
         model, samples, delta,
-        n_pretrain=proj_phase1_epochs, n_project=proj_phase2_epochs,
-        lr_pretrain=proj_lr1, lr_project=proj_lr2,
-        num_noisy=num_points_per_samples, r_inner=delta / 2,
+        n_pretrain=n_pretrain, n_project=n_projection,
+        lr_pretrain=lr_pretrain, lr_project=lr_projection,
+        num_noisy=num_noisy, r_inner=delta / 2,
         loss_pretrain={"C1": 1, "C3": 1},
         loss_project={"C1": 1, "C2": 0.5, "C3": 0.5},
         scheduler_pretrain="cosine", scheduler_project="cosine",
@@ -125,13 +125,13 @@ def train_projection_model():
 def train_diffusion_model(marginal_prob_std_fn):
     print("=" * 60)
     print("Training diffusion_model (score-based SDE, "
-          f"{diffusion_train_epochs} epochs)")
+          f"{n_diffusion} epochs)")
     print("=" * 60)
     torch.manual_seed(train_seed)
     model = ScoreNetVector(ambient_dim, marginal_prob_std_fn).to(device)
     train_diffusion(model, samples.to(device), marginal_prob_std_fn,
-                    n_epochs=diffusion_train_epochs,
-                    M=diffusion_train_M, lr=diffusion_train_lr)
+                    n_epochs=n_diffusion,
+                    M=diffusion_time_samples, lr=lr_diffusion)
     torch.save(model.state_dict(), diffusion_ckpt)
     print(f"Saved {diffusion_ckpt}")
     return model.eval()
@@ -162,7 +162,7 @@ def sample_diffusion_snapshots(score_model, ambient_dim, marginal_prob_std_fn,
     """Sample reverse ODE and capture states nearest the requested times."""
     score_model.eval()
     t1 = torch.ones(batch_size, device=device)
-    x = torch.randn(batch_size, ambient_dim, device=device) * \
+    x = torch.randn(batch_size, ambient_dim, device=device) *\
         marginal_prob_std_fn(t1)[:, None]
 
     time_steps = torch.linspace(1.0, eps, num_steps, device=device)
@@ -185,7 +185,7 @@ def sample_diffusion_snapshots(score_model, ambient_dim, marginal_prob_std_fn,
         if i >= int((1.0 - ode_last_frac) * num_steps):
             x = x + 0.5 * drift * step_size
         else:
-            x = x + drift * step_size + \
+            x = x + drift * step_size +\
                 torch.sqrt(step_size) * g[:, None] * torch.randn_like(x)
 
         if i in snapshot_indices:
@@ -314,7 +314,7 @@ def main():
                     or not diffusion_ckpt.exists())
 
     marginal_prob_std_fn, diffusion_coeff_fn = make_sde_fns(
-        sigma=diffusion_sigma)
+        sigma=sigma)
 
     if retrain_proj:
         projection_model = train_projection_model()
@@ -333,7 +333,7 @@ def main():
     snapshots, actual_times = sample_diffusion_snapshots(
         score_model, ambient_dim, marginal_prob_std_fn, diffusion_coeff_fn,
         desired_times,
-        batch_size=diffusion_batch_size,
+        batch_size=num_generated,
         num_steps=diffusion_num_steps,
         device=device, eps=diffusion_eps, ode_last_frac=1.0,
     )

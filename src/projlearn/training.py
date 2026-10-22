@@ -84,7 +84,8 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
                      c2_mode="exact", c2_subsample=0.2,
                      c2_fd_eps=1e-3,
                      save_dir=None, save_every_epochs=50, save_prefix="model",
-                     epoch_callback=None, metric_every=0):
+                     epoch_callback=None, metric_every=0,
+                     loss_chunk_size=None):
     """Train a projection model.
 
     Args:
@@ -98,6 +99,10 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
         batch_size: batch size when using dataloader mode
         loss_weights: dict like {"C1": 1, "C2": 0.5, "C3": 0.5}; defaults to {"C1": 1, "C3": 1}
         r_inner: inner radius for C3 term
+        c2_mode: "exact", "subsample", or "fd". C2 blends the mean squared
+            JVP norms A at T(x) and B at x. Each phase starts with s=0.5;
+            after each epoch, s=B/(A+B) using detached, sample-weighted
+            epoch means for the next epoch. If A=B=0, s stays at 0.5.
         lr: learning rate
         print_every: update tqdm description every this many iterations
         use_dataloader: if True, batch via DataLoader (for large datasets)
@@ -139,6 +144,10 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
         metric_every: frequency (in epochs) at which ``epoch_callback`` is
             invoked.  ``0`` (default) disables periodic invocation but the
             callback is still called once after the final epoch when set.
+        loss_chunk_size: optional maximum noisy points per loss computation.
+            Accumulate sample-weighted gradients over chunks, then take one
+            optimizer step per batch. This reduces peak memory without
+            changing the full-batch objective. None uses the entire batch.
 
     Returns:
         (final_loss, loss_history) — final loss value and per-epoch loss list
@@ -147,6 +156,9 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
         loss_weights = {"C1": 1, "C3": 1}
     if device is None:
         device = next(model.parameters()).device
+    if loss_chunk_size is not None and (
+            not isinstance(loss_chunk_size, int) or loss_chunk_size < 1):
+        raise ValueError("loss_chunk_size must be a positive integer or None")
 
     _prev_delta = prev_delta if prev_delta is not None else delta
     # Full training-set tensor kept on device for correct argmin search in C3.
@@ -156,13 +168,39 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
     lr_scheduler = _make_scheduler(optimizer, n_epochs, scheduler)
     iterator = trange(n_epochs, disable=not show_progress)
     loss_history = []
+    c2_balance = 0.5
     t0 = time.time()
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
 
+    def backward_loss(batch, smoothed):
+        """Backpropagate one batch, optionally accumulating noisy-point chunks."""
+        def compute_loss(points):
+            return projection_loss(
+                model, batch, points, model(points), loss_weights, r_inner,
+                delta=delta, c2_mode=c2_mode,
+                c2_subsample=c2_subsample, c2_fd_eps=c2_fd_eps,
+                all_samples=samples_dev, c2_balance=c2_balance,
+                return_c2_terms=True,
+            )
+
+        if loss_chunk_size is None:
+            loss, _, _, _, _, c2_a, c2_b = compute_loss(smoothed)
+            loss.backward()
+            return loss.detach(), c2_a, c2_b
+
+        totals = smoothed.new_zeros(3)
+        for points in smoothed.split(loss_chunk_size):
+            loss, _, _, _, _, c2_a, c2_b = compute_loss(points)
+            fraction = len(points) / len(smoothed)
+            (loss * fraction).backward()
+            totals += torch.stack((loss.detach(), c2_a, c2_b)) * fraction
+        return totals.unbind()
+
     if use_dataloader:
         for it in iterator:
+            c2_epoch = torch.zeros(2, device=device)
             for batch in DataLoader(samples, batch_size=batch_size, shuffle=True):
                 batch = batch.to(device)
                 optimizer.zero_grad(set_to_none=True)
@@ -174,15 +212,11 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
                 if refined is not None:
                     smoothed = torch.cat([smoothed, refined], dim=0)
 
-                output = model(smoothed)
-                total_loss, *_ = projection_loss(
-                    model, batch, smoothed, output, loss_weights, r_inner,
-                    delta=delta, c2_mode=c2_mode,
-                    c2_subsample=c2_subsample, c2_fd_eps=c2_fd_eps,
-                    all_samples=samples_dev,
-                )
-                total_loss.backward()
+                total_loss, c2_a, c2_b = backward_loss(batch, smoothed)
+                c2_epoch += torch.stack((c2_a, c2_b)) * len(smoothed)
                 optimizer.step()
+            c2_sum = c2_epoch.sum().item()
+            c2_balance = (c2_epoch[1].item() / c2_sum) if c2_sum > 0 else 0.5
             loss_history.append(total_loss.item())
             if lr_scheduler:
                 lr_scheduler.step()
@@ -228,16 +262,10 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
             if refined is not None:
                 smoothed = torch.cat([smoothed, refined], dim=0)
 
-            output = model(smoothed)
-            total_loss, *_ = projection_loss(
-                model, batch, smoothed, output, loss_weights, r_inner,
-                delta=delta, c2_mode=c2_mode,
-                c2_subsample=c2_subsample, c2_fd_eps=c2_fd_eps,
-                # In non-dataloader mode batch == samples_dev (full dataset),
-                # so all_samples is not needed here.
-            )
-            total_loss.backward()
+            total_loss, c2_a, c2_b = backward_loss(batch, smoothed)
             optimizer.step()
+            c2_sum = (c2_a + c2_b).item()
+            c2_balance = (c2_b.item() / c2_sum) if c2_sum > 0 else 0.5
             loss_history.append(total_loss.item())
             if lr_scheduler:
                 lr_scheduler.step()
@@ -393,6 +421,7 @@ def train_projection_algorithm1(
     save_prefix="alg1",
     epoch_callback=None,
     metric_every=0,
+    loss_chunk_size=None,
 ):
     """Algorithm 1 — Two-Stage Training of the Projection Model.
 
@@ -433,6 +462,8 @@ def train_projection_algorithm1(
         n_pre: legacy absolute-count refined-anchor budget (used only when
             ``prev_copies`` is None).
         c2_mode, c2_subsample, c2_fd_eps: forwarded to ``projection_loss``.
+        loss_chunk_size: optional noisy-point chunk size forwarded to
+            ``train_projection``; gradients accumulate before each Adam step.
         save_dir, save_every_epochs, save_prefix: optional periodic-checkpoint
             controls; written via ``train_projection`` with prefixes
             ``{save_prefix}_pretrain`` / ``{save_prefix}_project``.
@@ -477,6 +508,7 @@ def train_projection_algorithm1(
         c2_subsample=c2_subsample,
         c2_fd_eps=c2_fd_eps,
         metric_every=metric_every,
+        loss_chunk_size=loss_chunk_size,
     )
 
     save_pre = {}

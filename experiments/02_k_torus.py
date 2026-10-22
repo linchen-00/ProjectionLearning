@@ -42,8 +42,8 @@ from projlearn.sampling import tubular_nbh
 from projlearn.training import train_projection_algorithm1
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-_ROOT = Path(__file__).resolve().parent.parent
-MODEL_DIR = _ROOT / "trained_models" / "02_k_torus"
+root = Path(__file__).resolve().parent.parent
+save_dir = root / "trained_models" / "02_k_torus"
 
 # ── Device ───────────────────────────────────────────────────────────────────
 if torch.cuda.is_available():
@@ -55,16 +55,17 @@ else:
 print(f"Using device: {device}")
 
 # ── Experiment parameters ────────────────────────────────────────────────────
-D_VECTOR = [1, 2, 3, 4, 5]
-MIE_THRESHOLD = 0.02
-GROWTH_FACTOR = 1.2
-NSTEP = 30
-MAX_MULT = 50
-ITER_PRETRAIN = 500
-ITER_PROJECT = 1500
-LR = 1e-3
-BATCH_SIZE = 512
-NUM_NOISY = 100
+torus_dims = [1, 2, 3, 4, 5]
+mie_threshold = 0.02
+growth_factor = 1.2
+n_step = 30
+max_attempts = 50
+n_pretrain = 500
+n_projection = 1500
+lr_pretrain = 5e-3
+lr_projection = 1e-3
+batch_size = 512
+num_noisy = 100
 
 # ── Plot style ───────────────────────────────────────────────────────────────
 mpl.rcParams.update({
@@ -97,18 +98,18 @@ def train_torus_model(n, delta, ambient_dim, sampler=None, use_dataloader=False)
 
     train_projection_algorithm1(
         model, samples, delta,
-        n_pretrain=ITER_PRETRAIN, n_project=ITER_PROJECT,
-        lr_pretrain=5e-3, lr_project=LR,
-        num_noisy=NUM_NOISY, r_inner=delta / 2,
+        n_pretrain=n_pretrain, n_project=n_projection,
+        lr_pretrain=lr_pretrain, lr_project=lr_projection,
+        num_noisy=num_noisy, r_inner=delta / 2,
         loss_pretrain={"C1": 1, "C3": 1},
         loss_project={"C1": 1, "C2": 0.5, "C3": 0.5},
         scheduler_pretrain="constant", scheduler_project="constant",
-        batch_size=BATCH_SIZE, use_dataloader=use_dataloader,
+        batch_size=batch_size, use_dataloader=use_dataloader,
         show_progress=True, verbose=False, device=device,
     )
 
     M_delta = tubular_nbh(samples, delta, ambient_dim,
-                          num_points_per_sample=NUM_NOISY)
+                          num_points_per_sample=num_noisy)
     model_cpu = model.cpu()
     with torch.no_grad():
         manifold = model_cpu(model_cpu(M_delta))
@@ -125,7 +126,7 @@ def run_partA(force_train: bool):
     print("=" * 70)
     print(f"Using device: {device}")
 
-    checkpoint_path = MODEL_DIR / "checkpoint.pt"
+    checkpoint_path = save_dir / "checkpoint.pt"
 
     # ── Load path ─────────────────────────────────────────────────────────────
     if checkpoint_path.exists() and not force_train:
@@ -135,9 +136,9 @@ def run_partA(force_train: bool):
         all_trials = ckpt["all_trials"]
         completed_d = ckpt["completed_d"]
         next_start_n = ckpt["next_start_n"]
-        print(f"Loaded checkpoint from {checkpoint_path.relative_to(_ROOT)}")
+        print(f"Loaded checkpoint from {checkpoint_path.relative_to(root)}")
 
-        missing = [d for d in D_VECTOR if d not in completed_d]
+        missing = [d for d in torus_dims if d not in completed_d]
         if not missing:
             print(f"  All dimensions completed: {completed_d}")
             print(f"  n* values: {results_min_n}")
@@ -146,31 +147,31 @@ def run_partA(force_train: bool):
         results_min_n = []
         all_trials = []
         completed_d = []
-        next_start_n = NSTEP
+        next_start_n = n_step
         if force_train:
             print("--force-train: starting Part A from scratch")
 
     # ── Train loop ────────────────────────────────────────────────────────────
-    for d in D_VECTOR:
+    for d in torus_dims:
         if d in completed_d:
             print(f"\n[d={d}] already completed, skipping")
             continue
 
         ambient_dim = 2 * d
         delta_d = 1
-        n = max(next_start_n, NSTEP)
+        n = max(next_start_n, n_step)
         found = None
 
         print(f"\n[d={d}] delta={delta_d} (fixed), ambient={ambient_dim}, "
               f"starting at n={n}")
 
-        for attempt in range(MAX_MULT):
+        for attempt in range(max_attempts):
             use_dl = ambient_dim >= 8
             samples, manifold, model = train_torus_model(
                 n, delta_d, ambient_dim, use_dataloader=use_dl)
             mie_val, is_good = dist_torus_embedded(
                 manifold, torus_dim=d, ambient_dim=ambient_dim,
-                threshold=MIE_THRESHOLD)
+                threshold=mie_threshold)
             all_trials.append((d, n, mie_val))
             print(f"  attempt {attempt+1}: n={n}  MIE={mie_val:.6f}  "
                   f"{'PASS' if is_good else 'FAIL'}")
@@ -178,11 +179,11 @@ def run_partA(force_train: bool):
             if is_good:
                 found = n
                 torch.save(model.state_dict(),
-                           MODEL_DIR / f"torus_d{d}.pt")
+                           save_dir / f"torus_d{d}.pt")
                 del samples, manifold, model
                 break
 
-            n = max(n + NSTEP, int(math.ceil(n * GROWTH_FACTOR)))
+            n = max(n + n_step, int(math.ceil(n * growth_factor)))
             del samples, manifold, model
             gc.collect()
 
@@ -198,7 +199,7 @@ def run_partA(force_train: bool):
             "completed_d":   completed_d,
         }, checkpoint_path)
         print(f"  Checkpoint saved "
-              f"({len(completed_d)}/{len(D_VECTOR)} dims done)")
+              f"({len(completed_d)}/{len(torus_dims)} dims done)")
 
     print(f"\nPart A complete — n* values: {results_min_n}")
     return results_min_n, all_trials
@@ -206,14 +207,14 @@ def run_partA(force_train: bool):
 
 def plot_partA(results_min_n: list, all_trials: list) -> None:
     """Produce k_torus_n_vs_dim_mie.png and save trial_data.csv."""
-    d_arr = np.array(D_VECTOR, dtype=float)
+    d_arr = np.array(torus_dims, dtype=float)
     n_vals = np.array(
         [v if v is not None else np.nan for v in results_min_n], dtype=float)
     mask = np.isfinite(n_vals)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.semilogy(d_arr[mask], n_vals[mask], "o-", color="#1f77b4",
-                label=rf"$\mathrm{{MIE}} \leq {MIE_THRESHOLD}$")
+                label=rf"$\mathrm{{MIE}} \leq {mie_threshold}$")
 
     if mask.sum() >= 2:
         C_fit, b_fit = np.polyfit(d_arr[mask], np.log(n_vals[mask]), 1)
@@ -224,23 +225,23 @@ def plot_partA(results_min_n: list, all_trials: list) -> None:
 
     ax.set_xlabel(r"Intrinsic dimension $d$")
     ax.set_ylabel(r"Number of training samples $n$")
-    ax.set_xticks(D_VECTOR)
+    ax.set_xticks(torus_dims)
     ax.grid(True, which="major", linestyle="--", alpha=0.4)
     ax.legend(frameon=False)
     fig.subplots_adjust(left=0.12, right=0.98, bottom=0.10, top=0.96)
 
-    out = MODEL_DIR / "k_torus_n_vs_dim_mie.png"
+    out = save_dir / "k_torus_n_vs_dim_mie.png"
     fig.savefig(out, dpi=600)
     plt.close(fig)
-    print(f"Saved {out.relative_to(_ROOT)}")
+    print(f"Saved {out.relative_to(root)}")
 
     # Trial data CSV
-    csv_path = MODEL_DIR / "trial_data.csv"
+    csv_path = save_dir / "trial_data.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["d", "n", "mie"])
         w.writerows(all_trials)
-    print(f"Saved {csv_path.relative_to(_ROOT)}")
+    print(f"Saved {csv_path.relative_to(root)}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -253,7 +254,7 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
     print("=" * 70)
 
     ambient_256 = 256
-    partb_ckpt_path = MODEL_DIR / "partb_checkpoint.pt"
+    partb_ckpt_path = save_dir / "partb_checkpoint.pt"
 
     # ── Load path ─────────────────────────────────────────────────────────────
     if partb_ckpt_path.exists() and not force_train:
@@ -261,9 +262,9 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
                           weights_only=False)
         partb_results = ckpt["partb_results"]
         partb_completed = ckpt["partb_completed_d"]
-        print(f"Loaded checkpoint from {partb_ckpt_path.relative_to(_ROOT)}")
+        print(f"Loaded checkpoint from {partb_ckpt_path.relative_to(root)}")
 
-        missing = [d for d in D_VECTOR if d not in partb_completed]
+        missing = [d for d in torus_dims if d not in partb_completed]
         if not missing:
             _print_partB_table(partb_results, results_min_n)
             _save_partB_artifacts(partb_results)
@@ -280,7 +281,7 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
             return torus_embedded(n, torus_dim=torus_d, ambient_dim=amb)
         return sampler
 
-    for i, d in enumerate(D_VECTOR):
+    for i, d in enumerate(torus_dims):
         n_star = results_min_n[i]
         if n_star is None:
             print(f"\n[Part B d={d}] No n* from Part A, skipping.")
@@ -302,10 +303,10 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
             n_star, 1.0, ambient_256, sampler=sampler_256, use_dataloader=True)
         d1_amb_mie, d1_amb_pass = dist_torus_embedded(
             manifold_1, torus_dim=d, ambient_dim=ambient_256,
-            threshold=MIE_THRESHOLD)
+            threshold=mie_threshold)
         d1_emb_mie, _ = dist_torus_embedded(
             manifold_1[:, :2*d], torus_dim=d, ambient_dim=2*d,
-            threshold=MIE_THRESHOLD)
+            threshold=mie_threshold)
         print(f"    amb MIE={d1_amb_mie:.6f} ({'PASS' if d1_amb_pass else 'FAIL'}), "
               f"emb MIE={d1_emb_mie:.6f}")
         del manifold_1
@@ -318,10 +319,10 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
             sampler=sampler_256, use_dataloader=True)
         ds_amb_mie, ds_amb_pass = dist_torus_embedded(
             manifold_2, torus_dim=d, ambient_dim=ambient_256,
-            threshold=MIE_THRESHOLD)
+            threshold=mie_threshold)
         ds_emb_mie, _ = dist_torus_embedded(
             manifold_2[:, :2*d], torus_dim=d, ambient_dim=2*d,
-            threshold=MIE_THRESHOLD)
+            threshold=mie_threshold)
         print(f"    amb MIE={ds_amb_mie:.6f} ({'PASS' if ds_amb_pass else 'FAIL'}), "
               f"emb MIE={ds_emb_mie:.6f}")
         del manifold_2
@@ -345,7 +346,7 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
             "partb_completed_d": partb_completed,
         }, partb_ckpt_path)
         print(f"  Part B checkpoint saved "
-              f"({len(partb_completed)}/{len(D_VECTOR)} dims done)")
+              f"({len(partb_completed)}/{len(torus_dims)} dims done)")
 
     _print_partB_table(partb_results, results_min_n)
     _save_partB_artifacts(partb_results)
@@ -356,7 +357,7 @@ def _print_partB_table(partb_results: dict, results_min_n: list) -> None:
           f"{'amb_MIE(d=1)':>13} {'emb_MIE(d=1)':>13}  "
           f"{'amb_MIE(sc)':>12} {'emb_MIE(sc)':>12}")
     print("-" * 80)
-    for i, d in enumerate(D_VECTOR):
+    for i, d in enumerate(torus_dims):
         if d not in partb_results:
             continue
         r = partb_results[d]
@@ -366,18 +367,18 @@ def _print_partB_table(partb_results: dict, results_min_n: list) -> None:
 
 
 def _save_partB_artifacts(partb_results: dict) -> None:
-    json_path = MODEL_DIR / "partb_results.json"
+    json_path = save_dir / "partb_results.json"
     with open(json_path, "w") as f:
         json.dump({str(d): partb_results[d]
                   for d in partb_results}, f, indent=2)
-    print(f"\nSaved {json_path.relative_to(_ROOT)}")
+    print(f"\nSaved {json_path.relative_to(root)}")
 
     header = ["d", "n_star", "delta1",
               "delta1_amb_mie", "delta1_emb_mie", "delta1_amb_pass",
               "delta_scaled",
               "delta_scaled_amb_mie", "delta_scaled_emb_mie", "delta_scaled_amb_pass"]
     rows = []
-    for d in D_VECTOR:
+    for d in torus_dims:
         if d not in partb_results:
             continue
         r = partb_results[d]
@@ -386,12 +387,12 @@ def _save_partB_artifacts(partb_results: dict) -> None:
                      r["delta_scaled"],
                      r["delta_scaled_amb_mie"], r["delta_scaled_emb_mie"],
                      r["delta_scaled_amb_pass"]])
-    csv_path = MODEL_DIR / "partb_results.csv"
+    csv_path = save_dir / "partb_results.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
         w.writerows(rows)
-    print(f"Saved {csv_path.relative_to(_ROOT)}")
+    print(f"Saved {csv_path.relative_to(root)}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Main
@@ -400,7 +401,7 @@ def _save_partB_artifacts(partb_results: dict) -> None:
 
 def main():
     args = parse_args()
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     results_min_n, all_trials = run_partA(args.force_train)
     plot_partA(results_min_n, all_trials)
@@ -410,7 +411,7 @@ def main():
     print("\n" + "=" * 70)
     print("Experiment complete.")
     print(f"  Part A n* values : {results_min_n}")
-    print(f"  Outputs in       : {MODEL_DIR.relative_to(_ROOT)}")
+    print(f"  Outputs in       : {save_dir.relative_to(root)}")
     print("=" * 70)
 
 

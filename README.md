@@ -7,7 +7,7 @@ The repository contains:
 - `src/projlearn/`: reusable projection-learning components, including
   manifolds, models, losses, training loops, sampling, evaluation, and
   visualization utilities.
-- `experiments/`: scripts for the circle, torus, image-manifold, torus-union, high-dimensional torus, and MNIST experiments.
+- `experiments/`: scripts for the circle, torus, image-manifold, torus-union, high-dimensional torus, MNIST, and model-capacity experiments.
 - `requirements.txt`, `pyproject.toml`, and `run_all.sh`: installation and
   experiment-running utilities.
 
@@ -24,7 +24,8 @@ ProjectionLearning/
 │   ├── 03_torus_1d_images.py
 │   ├── 04_torus_circle_union.py
 │   ├── 05_torus_256d.py
-│   └── 06_mnist_multiseed.py
+│   ├── 06_mnist_multiseed.py
+│   └── 07_capacity_sweep.py
 ├── src/
 │   └── projlearn/
 ├── pyproject.toml
@@ -84,7 +85,7 @@ To retrain a single experiment, use the corresponding force flag. For example:
 python3 experiments/01_2d_circle.py --force-retrain
 ```
 
-To rerun every experiment in sequence:
+To run all experiments in sequence:
 
 ```bash
 bash run_all.sh
@@ -130,7 +131,9 @@ The second application is optional, but it can further refine samples because a 
 - Algorithm 1 trains a projection map at a single noise radius. It is a good default for low-dimensional manifolds and simple experiments.
 - For models trained with Algorithm 1, applying the learned projection map a small number of times can improve sampling quality.
 - Algorithm 2 trains projection maps across decreasing noise radii, giving a coarse-to-fine projection procedure. It is recommended for high-dimensional data such as images.
-- If the Jacobian-vector penalty in the objective is expensive, use `c2_mode="fd"` for a finite-difference approximation. Use `c2_mode="exact"` when you want the exact Jacobian-vector product.
+- All experiments use the adaptive C2 loss for projection training. It combines mean squared Jacobian-vector penalties at `T(x)` and `x`, starting with equal weights and rebalancing them after each epoch.
+- If the Jacobian-vector penalty in the objective is expensive, use `c2_mode="fd"` for a finite-difference approximation or `c2_mode="subsample"` to evaluate on the random subset. Use `c2_mode="exact"` for exact Jacobian-vector products on the full batch.
+- If a noisy batch does not fit in memory, set `loss_chunk_size` to process its points in smaller groups while keeping one optimizer update per batch.
 
 ## 6. Citation
 

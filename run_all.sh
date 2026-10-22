@@ -20,4 +20,5 @@ $PY experiments/05_torus_256d.py
 # 06: cached multi-seed evaluation. Pass --force-eval directly to
 # experiments/06_mnist_multiseed.py to recompute metrics.
 $PY experiments/06_mnist_multiseed.py
+$PY experiments/07_capacity_sweep.py
 echo "All experiments finished."

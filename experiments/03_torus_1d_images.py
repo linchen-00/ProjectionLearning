@@ -60,9 +60,9 @@ def main():
     })
 
     # ── Save / Load paths ──────────────────────────────────────────────────────
-    _ROOT = Path(__file__).resolve().parent.parent
-    SAVE_DIR = _ROOT / "trained_models" / "03_torus_1d"
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    root = Path(__file__).resolve().parent.parent
+    save_dir = root / "trained_models" / "03_torus_1d"
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Parameters ──────────────────────────────────────────────────────────────
     torch.manual_seed(2)
@@ -71,22 +71,29 @@ def main():
               else "cpu")
     print(f"Using device: {device}")
 
-    N = 30
+    n_samples = 30
     delta = 3
+    r_inner = 0.6
     ambient_dim = 64
     resolution = 8
     num_noisy = 250
     n_pretrain = 400
-    n_projection = 4600
+    n_projection = 1200  # Fixed budget tuned for adaptive C2 at r_inner=0.6.
     n_total = n_pretrain + n_projection
-    epoch_interval = 200
+    metric_every = 200
     lr_pretrain = 2e-3
     lr_projection = 1e-3
-    n_diff_epochs = 50000
-    epoch_interval_diff = 1000
+    n_diffusion = 50000
+    diffusion_metric_every = 1000
+    sigma = 25
+    lr_diffusion = 1e-3
+    diffusion_time_samples = 250
+    diffusion_num_steps = 5000
+    num_generated = 5000
+    diffusion_hidden_dims = (256, 512, 256)
 
     # ── Data ────────────────────────────────────────────────────────────────────
-    samples = circular_movement(N, ambient_dim)
+    samples = circular_movement(n_samples, ambient_dim)
 
     torch.manual_seed(0)
     new_samples = circular_movement(5000, ambient_dim)
@@ -102,7 +109,7 @@ def main():
         device=device, ambient_dim=ambient_dim,
     )
 
-    def project_to_coeff(data): return data @ basis.T / \
+    def project_to_coeff(data): return data @ basis.T /\
         (basis.norm(dim=1) ** 2)
 
     coeff_samples = project_to_coeff(samples.to(device)).cpu()
@@ -136,18 +143,15 @@ def main():
     # Projection metrics are recorded at every epoch_interval through BOTH
     # phase 1 (pretrain) and phase 2 (projection) so the saved checkpoint and
     # plots cover the full training trajectory.
-    epochs_list_proj = list(range(epoch_interval, n_total + 1, epoch_interval))
-    epochs_list_diff = list(range(epoch_interval_diff, n_diff_epochs + 1,
-                                  epoch_interval_diff))
+    epochs_list_proj = list(range(metric_every, n_total + 1, metric_every))
+    epochs_list_diff = list(range(diffusion_metric_every, n_diffusion + 1,
+                                  diffusion_metric_every))
     results_proj = {k: [] for k in ["perr", "mie", "memo"]}
     results_diff = {k: [] for k in ["perr", "mie", "memo"]}
 
-    sigma = 25
     marginal_prob_std_fn, diffusion_coeff_fn = make_sde_fns(sigma)
-    num_gen = 5000
-    diff_hidden_dims = (256, 512, 256)
 
-    checkpoint_path = SAVE_DIR / "checkpoint.pt"
+    checkpoint_path = save_dir / "checkpoint.pt"
     if checkpoint_path.exists() and not force_retrain:
         print(f"Loading saved checkpoint from {checkpoint_path} ...")
         ckpt = torch.load(
@@ -156,7 +160,7 @@ def main():
         projection_model.load_state_dict(ckpt["projection_model"])
         score_model = ScoreNetVector(
             ambient_dim, marginal_prob_std=marginal_prob_std_fn,
-            hidden_dims=diff_hidden_dims).to(device)
+            hidden_dims=diffusion_hidden_dims).to(device)
         score_model.load_state_dict(ckpt["score_model"])
         score_model.eval()
         results_proj = ckpt["results_proj"]
@@ -177,7 +181,7 @@ def main():
         projection_model = ProjectionNet(ambient_dim).to(device)
 
         def _on_metric(epoch, model_, info):
-            global_epoch = epoch if info["phase"] == "pretrain" \
+            global_epoch = epoch if info["phase"] == "pretrain"\
                 else n_pretrain + epoch
             was_training = model_.training
             model_.eval()
@@ -198,12 +202,12 @@ def main():
             projection_model, samples, delta,
             n_pretrain=n_pretrain, n_project=n_projection,
             lr_pretrain=lr_pretrain, lr_project=lr_projection,
-            num_noisy=num_noisy, r_inner=delta / 2,
+            num_noisy=num_noisy, r_inner=r_inner,
             loss_pretrain={"C1": 1, "C3": 1},
             loss_project={"C1": 1, "C2": 1, "C3": 1},
             scheduler_pretrain="constant", scheduler_project="cosine",
-            print_every=epoch_interval, device=device,
-            epoch_callback=_on_metric, metric_every=epoch_interval,
+            print_every=metric_every, device=device,
+            epoch_callback=_on_metric, metric_every=metric_every,
         )
 
         # Final projection metrics — reported only after BOTH phases finish.
@@ -228,7 +232,7 @@ def main():
 
         score_model = ScoreNetVector(
             ambient_dim, marginal_prob_std=marginal_prob_std_fn,
-            hidden_dims=diff_hidden_dims).to(device)
+            hidden_dims=diffusion_hidden_dims).to(device)
         x_diff = samples.to(device)
 
         def _on_diff_metric(epoch, model_, info):
@@ -237,8 +241,8 @@ def main():
             with torch.no_grad():
                 gen, _ = vector_sampler_with_traj(
                     model_, ambient_dim, marginal_prob_std_fn,
-                    diffusion_coeff_fn, batch_size=num_gen,
-                    num_steps=5000, device=device, ode_last_frac=1,
+                    diffusion_coeff_fn, batch_size=num_generated,
+                    num_steps=diffusion_num_steps, device=device, ode_last_frac=1,
                 )
             if was_training:
                 model_.train()
@@ -250,18 +254,18 @@ def main():
 
         train_diffusion(
             score_model, x_diff, marginal_prob_std_fn,
-            n_epochs=n_diff_epochs, M=250, lr=1e-3,
+            n_epochs=n_diffusion, M=diffusion_time_samples, lr=lr_diffusion,
             show_progress=True, device=device,
             epoch_callback=_on_diff_metric,
-            metric_every=epoch_interval_diff,
+            metric_every=diffusion_metric_every,
         )
 
         # Final diffusion Pr curve.
         score_model.eval()
         gen_final, _ = vector_sampler_with_traj(
             score_model, ambient_dim, marginal_prob_std_fn,
-            diffusion_coeff_fn, batch_size=num_gen,
-            num_steps=5000, device=device, ode_last_frac=1,
+            diffusion_coeff_fn, batch_size=num_generated,
+            num_steps=diffusion_num_steps, device=device, ode_last_frac=1,
         )
         coeff_gen = project_to_coeff(gen_final.to(device)).cpu()
         Pr_diff = Pr(coeff_samples[:, 1:], coeff_gen[:, 1:], r_vector)
@@ -324,7 +328,7 @@ def main():
     lo, hi = _band(results_diff["mie"])
     ax_diff.fill_between(ed, lo, hi, color=c_mie, alpha=band_alpha)
 
-    ed_mapped = np.interp(ed, [0, n_diff_epochs], [0, n_total])
+    ed_mapped = np.interp(ed, [0, n_diffusion], [0, n_total])
     l6, = ax_memo.plot(ed_mapped, results_diff["memo"], "--", color=c_memo,
                        lw=2, label="Memo (diff)")
     lo, hi = _band(results_diff["memo"])
@@ -335,12 +339,12 @@ def main():
     ax_proj.set_ylabel("MIE", fontsize=14)
     ax_memo.set_ylabel("Memo", fontsize=14)
     ax_proj.set_xlim(0, n_total)
-    ax_diff.set_xlim(0, n_diff_epochs)
+    ax_diff.set_xlim(0, n_diffusion)
     ax_proj.legend(handles=[l1, l3, l4, l6], loc="lower right",
                    fontsize=14, framealpha=0.9,
                    bbox_to_anchor=(1.0, 0.15))
     fig1.tight_layout()
-    fig1.savefig(SAVE_DIR / "torus_1d_metrics.png",
+    fig1.savefig(save_dir / "torus_1d_metrics.png",
                  dpi=600, bbox_inches="tight")
     plt.show()
     print("Saved torus_1d_metrics.png")
@@ -375,7 +379,7 @@ def main():
     ax2.set_ylabel(r"$P_r$", fontsize=14)
     ax2.legend(loc="lower right", fontsize=14)
     fig2.tight_layout()
-    fig2.savefig(SAVE_DIR / "torus_1d_Pr.png",
+    fig2.savefig(save_dir / "torus_1d_Pr.png",
                  dpi=600, bbox_inches="tight")
     plt.show()
     print("Saved torus_1d_Pr.png")
@@ -384,7 +388,7 @@ def main():
     # Plot 3: Combined illustration — 4 rows × n_show columns
     # =========================================================================
     n_show = 4
-    idx_show = np.linspace(0, N - 1, n_show, dtype=int)
+    idx_show = np.linspace(0, n_samples - 1, n_show, dtype=int)
 
     with torch.no_grad():
         noisy = inject_randomness(
@@ -434,7 +438,7 @@ def main():
             spine.set_visible(False)
 
     plt.tight_layout()
-    fig.savefig(SAVE_DIR / "torus_1d_illustration.png",
+    fig.savefig(save_dir / "torus_1d_illustration.png",
                 dpi=600, bbox_inches="tight")
     plt.show()
     print("Saved torus_1d_illustration.png")
@@ -450,12 +454,12 @@ def main():
 
     plot_2d(coeff_proj_gen[:, 1:], coeff_train[:, 1:], delta=delta,
             ambient_dim=2,
-            save_path=SAVE_DIR / "torus_1d_coeff_proj.png")
+            save_path=save_dir / "torus_1d_coeff_proj.png")
     print("Saved torus_1d_coeff_proj.png")
 
     plot_2d(coeff_diff_gen[:, 1:], coeff_train[:, 1:], delta=delta,
             ambient_dim=2,
-            save_path=SAVE_DIR / "torus_1d_coeff_diff.png")
+            save_path=save_dir / "torus_1d_coeff_diff.png")
     print("Saved torus_1d_coeff_diff.png")
 
 

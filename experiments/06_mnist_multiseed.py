@@ -70,44 +70,45 @@ from projlearn.training import (  # noqa: E402
     train_diffusion, train_projection_algorithm2,
 )
 
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
+here = Path(__file__).resolve().parent
+root = here.parent
 
 # ── Paths / config ────────────────────────────────────────────────────────────
-PROJ_BASE = _ROOT / "trained_models" / "06_mnist" / "all_digits_multiseed"
-DIFF_BASE = _ROOT / "trained_models" / "06_mnist" / "diffusion_multiseed"
-FIGURES_DIR = _ROOT / "trained_models" / "06_mnist" / "figures"
-MNIST_DATA_DIR = str(_ROOT)
+projection_dir = root / "trained_models" / "06_mnist" / "all_digits_multiseed"
+diffusion_dir = root / "trained_models" / "06_mnist" / "diffusion_multiseed"
+figures_dir = root / "trained_models" / "06_mnist" / "figures"
+mnist_data_dir = str(root)
 
-SEEDS = [0, 2, 3, 4, 6]
-N_TRAIN = 10_000
-N_REF_HELDOUT = 10_000   # how many of remain_samples to use as held-out ref
-DELTAS = [20.0, 8.0, 4.0]
-R_INNERS = [8.0, 4.0, 2.0]
-DELTA_GEN = 20.0
-NPS = 1            # noisy points per training sample at generation
-CHANNELS = (16, 32, 64, 128)
-STAGE_SPECS = [
-    {"iter1": 100, "iter2": 50},
-    {"iter1": 100, "iter2": 50},
-    {"iter1": 100, "iter2": 50},
-]
+seeds = [0, 2, 3, 4, 6]
+n_samples = 10_000
+n_ref_heldout = 10_000   # how many of remain_samples to use as held-out ref
+deltas = [20.0, 8.0, 4.0]
+r_inners = [8.0, 4.0, 2.0]
+delta_generation = 20.0
+num_noisy_generation = 1            # noisy points per training sample at generation
+channels = (16, 32, 64, 128)
+n_pretrain = [100, 100, 100]
+n_projection = [50, 50, 50]
+# The checkpoint loader uses these historical phase-key names.
+stage_specs = [{"iter1": pre, "iter2": project}
+               for pre, project in zip(n_pretrain, n_projection)]
 
 # Diffusion (VE-SDE) hyper-parameters — match the notebook
-DIFF_SIGMA = 25.0
-DIFF_EPOCHS = 300
-DIFF_BATCH = 64
-DIFF_LR = 1e-4
-DIFF_NUM_STEPS = 500
-DIFF_SNR = 0.16
+sigma = 25.0
+n_diffusion = 300
+diffusion_time_samples = 1
+diffusion_batch_size = 64
+lr_diffusion = 1e-4
+diffusion_num_steps = 500
+diffusion_snr = 0.16
 
 # Projection-cascade training hyper-parameters
-TRAIN_BATCH = 64
-TRAIN_LR1 = 2e-3
-TRAIN_LR2 = 5e-4
-TRAIN_NUM_POINTS = 50
-LOSS_PRE = {"C1": 1, "C3": 1}
-LOSS_TRAIN = {"C1": 1, "C2": 1, "C3": 1}
+batch_size = 64
+lr_pretrain = 2e-3
+lr_projection = 5e-4
+num_noisy = 50
+loss_pretrain = {"C1": 1, "C3": 1}
+loss_projection = {"C1": 1, "C2": 1, "C3": 1}
 
 device = (
     torch.device("cuda") if torch.cuda.is_available()
@@ -121,14 +122,14 @@ print(f"Using device: {device}")
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _get_mnist_subset(N: int, seed: int):
+def _get_mnist_subset(n_samples: int, seed: int):
     """Replicates notebook ``get_mnist_subset(digit=None, N, seed)``."""
-    ds = MNIST(MNIST_DATA_DIR, train=True, download=True,
+    ds = MNIST(mnist_data_dir, train=True, download=True,
                transform=transforms.ToTensor())
     imgs = torch.stack([img.view(-1) for img, _ in ds], dim=0).float()
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(len(imgs), generator=g)
-    n_eff = min(N, len(imgs))
+    n_eff = min(n_samples, len(imgs))
     return imgs[perm[:n_eff]].contiguous(), imgs[perm[n_eff:]].contiguous()
 
 
@@ -142,11 +143,11 @@ def _validate_split(split_file: Path) -> tuple[bool, str]:
     rm = ck.get("remain_samples")
     if tr is None or rm is None:
         return False, "Missing keys 'train_samples' or 'remain_samples'"
-    if tr.shape != (N_TRAIN, 784):
-        return False, f"train_samples shape {tuple(tr.shape)} != ({N_TRAIN}, 784)"
+    if tr.shape != (n_samples, 784):
+        return False, f"train_samples shape {tuple(tr.shape)} != ({n_samples}, 784)"
     if rm.shape[1] != 784:
         return False, f"remain_samples has wrong feature dim {rm.shape[1]}"
-    expected_remain = 60_000 - N_TRAIN
+    expected_remain = 60_000 - n_samples
     if rm.shape[0] != expected_remain:
         return (False,
                 f"remain_samples size {rm.shape[0]} != expected {expected_remain}")
@@ -159,12 +160,12 @@ def _load_split(seed_dir: Path, seed: int, *,
 
     ``seed_dir`` is the directory where the split should live.  For diffusion
     seeds, callers pass the corresponding projection seed directory
-    (``PROJ_BASE / f"seed{s}"``), because projection and diffusion use the same
+    (``projection_dir / f"seed{s}"``), because projection and diffusion use the same
     10 k training samples for every seed.
 
     Priority once ``seed_dir`` is resolved:
       1. ``seed_dir / mnist_samples_split.pth``  — primary file
-      2. Safety-net fallback: ``PROJ_BASE / seed_dir.name / mnist_samples_split.pth``
+      2. Safety-net fallback: ``projection_dir / seed_dir.name / mnist_samples_split.pth``
          (only reached if the caller passes a non-projection directory)
       3. Deterministically regenerate from the MNIST training set and save the
          split in ``seed_dir`` (only when both 1+2 are absent, or when forced)
@@ -172,7 +173,7 @@ def _load_split(seed_dir: Path, seed: int, *,
     Existing files are **never** overwritten unless ``force_regen=True``.
     """
     own_file = seed_dir / "mnist_samples_split.pth"
-    proj_file = PROJ_BASE / seed_dir.name / "mnist_samples_split.pth"
+    proj_file = projection_dir / seed_dir.name / "mnist_samples_split.pth"
 
     candidate = None
     source_label = ""
@@ -194,8 +195,8 @@ def _load_split(seed_dir: Path, seed: int, *,
                 print(f"  [SPLIT WARN] {proj_file}: {msg}")
 
     if candidate is None:
-        print(f"  [SPLIT] seed{seed}: generating fresh split (N={N_TRAIN})")
-        train_s, remain_s = _get_mnist_subset(N=N_TRAIN, seed=seed)
+        print(f"  [SPLIT] seed{seed}: generating fresh split (N={n_samples})")
+        train_s, remain_s = _get_mnist_subset(n_samples=n_samples, seed=seed)
         seed_dir.mkdir(parents=True, exist_ok=True)
         torch.save({"train_samples": train_s.cpu(),
                     "remain_samples": remain_s.cpu()}, own_file)
@@ -212,7 +213,7 @@ def _load_split(seed_dir: Path, seed: int, *,
 
 def _projection_ckpts_complete(seed_dir: Path) -> bool:
     """All 2*K cascade snapshots present in seed_dir (either layout)?"""
-    for i, spec in enumerate(STAGE_SPECS):
+    for i, spec in enumerate(stage_specs):
         for phase, ep in (("a", spec["iter1"]), ("b", spec["iter2"])):
             phase_name = "pretrain" if phase == "a" else "project"
             legacy = seed_dir / f"model{i}{phase}_epoch{ep}.pth"
@@ -227,21 +228,19 @@ def _train_projection_cascade(seed: int, train_flat: torch.Tensor,
     seed_dir.mkdir(parents=True, exist_ok=True)
     print(f"  [TRAIN proj cascade]  seed={seed}  → {seed_dir}")
     torch.manual_seed(seed)
-    model = ProjectionUNet(image_size=28, channels=CHANNELS,
+    model = ProjectionUNet(image_size=28, channels=channels,
                            in_channels=1).to(device)
     samples_dev = train_flat.to(device)
-    n_pretrain = [spec["iter1"] for spec in STAGE_SPECS]
-    n_project = [spec["iter2"] for spec in STAGE_SPECS]
-    save_every = min(min(n_pretrain), min(n_project))
+    save_every = min(min(n_pretrain), min(n_projection))
     out = train_projection_algorithm2(
         model, samples_dev,
-        deltas=list(DELTAS), r_inners=list(R_INNERS),
-        n_pretrain=n_pretrain, n_project=n_project,
-        lr_pretrain=TRAIN_LR1, lr_project=TRAIN_LR2,
-        num_points_per_samples=TRAIN_NUM_POINTS,
-        loss_pretrain=LOSS_PRE, loss_project=LOSS_TRAIN,
+        deltas=list(deltas), r_inners=list(r_inners),
+        n_pretrain=n_pretrain, n_project=n_projection,
+        lr_pretrain=lr_pretrain, lr_project=lr_projection,
+        num_points_per_samples=num_noisy,
+        loss_pretrain=loss_pretrain, loss_project=loss_projection,
         scheduler_pretrain="constant", scheduler_project="constant",
-        batch_size=TRAIN_BATCH, use_dataloader=True,
+        batch_size=batch_size, use_dataloader=True,
         print_every=20, show_progress=True, device=device,
         save_dir=str(seed_dir), save_every_epochs=save_every,
         save_prefix="alg2",
@@ -258,13 +257,13 @@ def _train_diffusion_score_and_sample(seed: int, train_flat: torch.Tensor,
                                       seed_dir: Path) -> torch.Tensor:
     seed_dir.mkdir(parents=True, exist_ok=True)
     print(f"  [TRAIN diffusion]     seed={seed}  → {seed_dir}")
-    marginal_prob_std_fn, diffusion_coeff_fn = make_sde_fns(sigma=DIFF_SIGMA)
+    marginal_prob_std_fn, diffusion_coeff_fn = make_sde_fns(sigma=sigma)
     torch.manual_seed(seed)
     model = ScoreNet(marginal_prob_std=marginal_prob_std_fn).to(device)
     images = train_flat.view(-1, 1, 28, 28).to(device)
     train_diffusion(model, images, marginal_prob_std_fn,
-                    n_epochs=DIFF_EPOCHS, M=1, lr=DIFF_LR,
-                    use_dataloader=True, batch_size=DIFF_BATCH, device=device)
+                    n_epochs=n_diffusion, M=diffusion_time_samples, lr=lr_diffusion,
+                    use_dataloader=True, batch_size=diffusion_batch_size, device=device)
     torch.save(model.state_dict(), seed_dir / "score_model.pth")
     print(f"  [DONE diffusion train] seed={seed}; "
           f"sampling {train_flat.shape[0]} images …")
@@ -275,7 +274,7 @@ def _train_diffusion_score_and_sample(seed: int, train_flat: torch.Tensor,
     torch.manual_seed(seed)
     for b in range((n_total + bs - 1) // bs):
         x = pc_sampler(model, marginal_prob_std_fn, diffusion_coeff_fn,
-                       batch_size=bs, num_steps=DIFF_NUM_STEPS, snr=DIFF_SNR,
+                       batch_size=bs, num_steps=diffusion_num_steps, snr=diffusion_snr,
                        device=device, eps=1e-3, image_size=28, channels=1,
                        show_progress=(b == 0))
         chunks.append(x.view(bs, -1).clamp(0.0, 1.0).cpu())
@@ -292,7 +291,7 @@ def _sample_diffusion_from_checkpoint(seed: int, n_total: int,
         return None
 
     print(f"  [DIFFUSION] seed{seed}: sampling from {ckpt_path.name}")
-    marginal_prob_std_fn, diffusion_coeff_fn = make_sde_fns(sigma=DIFF_SIGMA)
+    marginal_prob_std_fn, diffusion_coeff_fn = make_sde_fns(sigma=sigma)
     model = ScoreNet(marginal_prob_std=marginal_prob_std_fn).to(device)
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
     if not isinstance(state, dict):
@@ -308,8 +307,8 @@ def _sample_diffusion_from_checkpoint(seed: int, n_total: int,
     for b in range((n_total + bs - 1) // bs):
         batch_size = min(bs, n_total - b * bs)
         x = pc_sampler(model, marginal_prob_std_fn, diffusion_coeff_fn,
-                       batch_size=batch_size, num_steps=DIFF_NUM_STEPS,
-                       snr=DIFF_SNR, device=device, eps=1e-3, image_size=28,
+                       batch_size=batch_size, num_steps=diffusion_num_steps,
+                       snr=diffusion_snr, device=device, eps=1e-3, image_size=28,
                        channels=1, show_progress=(b == 0))
         chunks.append(x.view(batch_size, -1).clamp(0.0, 1.0).cpu())
     del model
@@ -322,10 +321,10 @@ def _generate_projection(seed: int, train_flat: torch.Tensor,
                          force_retrain: bool = False) -> torch.Tensor:
     if force_retrain or not _projection_ckpts_complete(seed_dir):
         _train_projection_cascade(seed, train_flat, seed_dir)
-    models = load_digit_models(seed_dir, STAGE_SPECS, CHANNELS, device)
+    models = load_digit_models(seed_dir, stage_specs, channels, device)
     torch.manual_seed(seed)
-    M_delta = tubular_nbh(train_flat, delta=DELTA_GEN, ambient_dim=784,
-                          num_chosen_samples=None, num_points_per_sample=NPS)
+    M_delta = tubular_nbh(train_flat, delta=delta_generation, ambient_dim=784,
+                          num_chosen_samples=None, num_points_per_sample=num_noisy_generation)
     with torch.no_grad():
         gen = compose(models, M_delta.to(device)).cpu()
     del models
@@ -410,7 +409,7 @@ def _format_report(label: str, seeds: list[int], n_train: int,
     L.append(f"N per seed  : {n_train}  |  {hyper_line}")
     L.append(
         f"n (# seeds) : {n}  |  t_{{0.025,{n-1}}} = {t_crit:.4f}  (95 % CI)")
-    L.append(f"Held-out ref: first {N_REF_HELDOUT} rows of per-seed remain_samples "
+    L.append(f"Held-out ref: first {n_ref_heldout} rows of per-seed remain_samples "
              f"(zero cross-seed contamination)")
     L.append(bar)
     L.append(f"  {'Metric':<36} {'Mean':>10} {'Std':>10} {'95 % CI ±':>10}"
@@ -449,7 +448,7 @@ def _format_report(label: str, seeds: list[int], n_train: int,
 # Figure helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-_PR_RCPARAMS = {
+pr_rcparams = {
     "font.family": "serif",
     "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
     "mathtext.fontset": "dejavuserif",
@@ -464,7 +463,7 @@ def _save_aggregate_pr_test_both(pr_proj: dict, pr_diff: dict,
     figsize=(8,6).  No title.
     """
     import matplotlib.pyplot as plt
-    plt.rcParams.update(_PR_RCPARAMS)
+    plt.rcParams.update(pr_rcparams)
 
     fig, ax = plt.subplots(figsize=(8, 6))
     r_mean_ref = None
@@ -534,7 +533,7 @@ def _save_per_seed_pr_2panel(seed: int,
     figsize=(9.6, 3.9).  No title.
     """
     import matplotlib.pyplot as plt
-    plt.rcParams.update(_PR_RCPARAMS)
+    plt.rcParams.update(pr_rcparams)
 
     panel_data = [
         (pr_proj_h, pr_diff_h),
@@ -623,7 +622,7 @@ def _save_nn_figure(gen: torch.Tensor, train_s: torch.Tensor,
     import matplotlib.pyplot as plt
     import numpy as np
 
-    plt.rcParams.update(_PR_RCPARAMS)
+    plt.rcParams.update(pr_rcparams)
 
     n_left = n_rows * n_cols_left
 
@@ -786,7 +785,7 @@ def _evaluate_seed(seed: int, gen: torch.Tensor, train_s: torch.Tensor,
     emb_train = collect_embeddings_from_tensor(capsnet, train_s)
 
     # Per-seed held-out reference: first N_REF_HELDOUT of this seed's remain
-    ref_heldout = remain_s[:N_REF_HELDOUT]
+    ref_heldout = remain_s[:n_ref_heldout]
     emb_held = collect_embeddings_from_tensor(capsnet, ref_heldout)
     emb_test = emb_test_shared
 
@@ -809,7 +808,7 @@ def _evaluate_seed(seed: int, gen: torch.Tensor, train_s: torch.Tensor,
 
 def _shared_test_embedding(capsnet) -> torch.Tensor:
     """Embed 10 000 MNIST test images once (seed=999)."""
-    ds = MNIST(MNIST_DATA_DIR, train=False, download=True,
+    ds = MNIST(mnist_data_dir, train=False, download=True,
                transform=transforms.ToTensor())
     g = torch.Generator().manual_seed(999)
     idx = torch.randperm(len(ds), generator=g)[:10_000].tolist()
@@ -834,9 +833,9 @@ def _save_pr_sidecar(path: Path,
     pr_ref_h = np.stack([pr_heldout[s][2] for s in seeds_h], axis=0)
 
     seeds_t = sorted(pr_test.keys())
-    pr_gen_t = np.stack([pr_test[s][1] for s in seeds_t], axis=0) \
+    pr_gen_t = np.stack([pr_test[s][1] for s in seeds_t], axis=0)\
         if seeds_t else np.empty((0,))
-    pr_ref_t = np.stack([pr_test[s][2] for s in seeds_t], axis=0) \
+    pr_ref_t = np.stack([pr_test[s][2] for s in seeds_t], axis=0)\
         if seeds_t else np.empty((0,))
 
     np.savez(path,
@@ -871,18 +870,18 @@ def _load_pr_sidecar(path: Path):
 
 def _hyper_label(kind: str):
     if kind == "projection":
-        hyper = (f"Deltas : {[int(d) for d in DELTAS]}  |  "
-                 f"R_inners : {[int(r) for r in R_INNERS]}  |  "
-                 f"channels={list(CHANNELS)}")
+        hyper = (f"Deltas : {[int(d) for d in deltas]}  |  "
+                 f"R_inners : {[int(r) for r in r_inners]}  |  "
+                 f"channels={list(channels)}")
         label = "All Digits (IPA Projection Model)"
     else:
-        hyper = (f"sigma={DIFF_SIGMA}  |  epochs={DIFF_EPOCHS}  "
-                 f"|  sample_steps={DIFF_NUM_STEPS}  |  snr={DIFF_SNR}")
+        hyper = (f"sigma={sigma}  |  epochs={n_diffusion}  "
+                 f"|  sample_steps={diffusion_num_steps}  |  snr={diffusion_snr}")
         label = "Diffusion Model (VE-SDE / ScoreNet U-Net)"
     return hyper, label
 
 
-def run_model(kind: str, capsnet, emb_test_shared, seeds=SEEDS,
+def run_model(kind: str, capsnet, emb_test_shared, seeds=seeds,
               figures=None, *,
               force_retrain: bool = False,
               force_eval: bool = False):
@@ -896,18 +895,18 @@ def run_model(kind: str, capsnet, emb_test_shared, seeds=SEEDS,
       'train_per_seed': {seed: tensor(N,784)}
     """
     assert kind in ("projection", "diffusion")
-    base = PROJ_BASE if kind == "projection" else DIFF_BASE
+    base = projection_dir if kind == "projection" else diffusion_dir
     figures = figures if figures is not None else []
 
     print(f"\n{'#'*72}\n# {kind.upper()}  base={base}\n{'#'*72}")
     base.mkdir(parents=True, exist_ok=True)
-    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
     report_txt = base / "multiseed_report.txt"
     results_json = base / "multiseed_results.json"
     sidecar_path = base / "multiseed_pr_data.npz"
 
-    use_cache = (not force_retrain) and (not force_eval) \
+    use_cache = (not force_retrain) and (not force_eval)\
         and report_txt.exists() and results_json.exists()
 
     if use_cache:
@@ -917,7 +916,7 @@ def run_model(kind: str, capsnet, emb_test_shared, seeds=SEEDS,
         per_seed = {int(k): v for k, v in raw.items()}
         wanted = [s for s in seeds if s in per_seed]
         hyper, label = _hyper_label(kind)
-        print("\n" + _format_report(label, wanted, N_TRAIN, per_seed, hyper))
+        print("\n" + _format_report(label, wanted, n_samples, per_seed, hyper))
 
         pr_heldout, pr_test = _load_pr_sidecar(sidecar_path)
 
@@ -941,7 +940,7 @@ def run_model(kind: str, capsnet, emb_test_shared, seeds=SEEDS,
                 train_s, _ = _load_split(seed_dir, seed=s)
                 gen_per_seed[s] = gen
                 train_per_seed[s] = train_s
-                out_png = FIGURES_DIR / f"nn_proj_seed{s}.png"
+                out_png = figures_dir / f"nn_proj_seed{s}.png"
                 f = _save_nn_figure(gen, train_s, out_png)
                 if f is not None:
                     figures.append(f)
@@ -964,7 +963,7 @@ def run_model(kind: str, capsnet, emb_test_shared, seeds=SEEDS,
         print(f"\n--- seed {s}  ({seed_dir.name}) ---")
         # Diffusion always uses the projection seed's split file: projection
         # and diffusion share the same 10 k training samples for every seed.
-        split_dir = PROJ_BASE / f"seed{s}" if kind == "diffusion" else seed_dir
+        split_dir = projection_dir / f"seed{s}" if kind == "diffusion" else seed_dir
         train_s, remain_s = _load_split(split_dir, seed=s,
                                         force_regen=force_retrain)
         if kind == "projection":
@@ -996,7 +995,7 @@ def run_model(kind: str, capsnet, emb_test_shared, seeds=SEEDS,
             torch.save(gen.cpu(), seed_dir / "proj_generated_samples.pt")
             if s == 0:
                 try:
-                    out_png = FIGURES_DIR / f"nn_proj_seed{s}.png"
+                    out_png = figures_dir / f"nn_proj_seed{s}.png"
                     f = _save_nn_figure(gen, train_s, out_png)
                     if f is not None:
                         figures.append(f)
@@ -1005,7 +1004,7 @@ def run_model(kind: str, capsnet, emb_test_shared, seeds=SEEDS,
 
     # Emit text report + JSON
     hyper, label = _hyper_label(kind)
-    txt = _format_report(label, seeds, N_TRAIN, per_seed, hyper)
+    txt = _format_report(label, seeds, n_samples, per_seed, hyper)
     print("\n" + txt)
     report_txt.write_text(txt + "\n")
     results_json.write_text(
@@ -1049,11 +1048,11 @@ def main():
     force_diff = args.force_retrain or args.force_retrain_diffusion
     force_eval = args.force_eval
 
-    print(f"Device: {device}  |  seeds: {SEEDS}")
+    print(f"Device: {device}  |  seeds: {seeds}")
     print(f"force_eval={force_eval}  force_proj={force_proj}  "
           f"force_diff={force_diff}")
 
-    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
     todo = (["projection", "diffusion"] if args.only == "both"
             else [args.only])
@@ -1061,7 +1060,7 @@ def main():
     # Set up CapsNet if any fresh evaluation is needed
     needs_fresh = []
     for k in todo:
-        base = PROJ_BASE if k == "projection" else DIFF_BASE
+        base = projection_dir if k == "projection" else diffusion_dir
         fk = force_proj if k == "projection" else force_diff
         if fk or force_eval or not (
                 (base / "multiseed_report.txt").exists()
@@ -1086,7 +1085,7 @@ def main():
         try:
             results[k] = run_model(
                 k, capsnet, emb_test,
-                seeds=SEEDS, figures=figures,
+                seeds=seeds, figures=figures,
                 force_retrain=fk,
                 force_eval=force_eval)
         except FileNotFoundError as e:
@@ -1102,7 +1101,7 @@ def main():
     if pr_test_proj or pr_test_diff:
         f = _save_aggregate_pr_test_both(
             pr_test_proj, pr_test_diff,
-            FIGURES_DIR / "aggregate_pr_curve_test_reference.png")
+            figures_dir / "aggregate_pr_curve_test_reference.png")
         if f is not None:
             figures.append(f)
 
@@ -1116,7 +1115,7 @@ def main():
         pt_d = pr_test_diff.get(s)
         if ph_p is None and ph_d is None and pt_p is None and pt_d is None:
             continue
-        out_png = FIGURES_DIR / f"combined_pr_seed{s}_2panel.png"
+        out_png = figures_dir / f"combined_pr_seed{s}_2panel.png"
         f = _save_per_seed_pr_2panel(s, ph_p, ph_d, pt_p, pt_d, out_png)
         if f is not None:
             figures.append(f)
