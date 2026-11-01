@@ -73,12 +73,12 @@ def main():
 
     n_samples = 30
     delta = 3
-    r_inner = 0.6
+    r_inner = 1.5
     ambient_dim = 64
     resolution = 8
     num_noisy = 250
     n_pretrain = 400
-    n_projection = 1200  # Fixed budget tuned for adaptive C2 at r_inner=0.6.
+    n_projection = 4600
     n_total = n_pretrain + n_projection
     metric_every = 200
     lr_pretrain = 2e-3

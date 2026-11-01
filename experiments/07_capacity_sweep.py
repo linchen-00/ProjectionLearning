@@ -2,14 +2,15 @@
 
 What this experiment does
 -------------------------
-This script uses the same 8x8 image manifold and projection-training settings
-as Experiment 03. It compares four model capacities across five training seeds
-for two methods:
+This script uses the same 8x8 image manifold as Experiment 03. It compares
+four model capacities across five training seeds for two methods:
 1. a projection model with Algorithm 1 and adaptive C2
 2. a score-based diffusion model (VE-SDE)
 
 Training, validation, and test geometries are fixed across seeds. For each
 method and capacity, it selects the checkpoint with minimum validation MIE.
+Projection models use 700 pretraining updates followed by 10,000 projection
+updates, with capacity-specific learning rates, adaptive C2, and inner radius 1.5.
 
 It saves:
 1. per-seed checkpoints and metrics
@@ -58,12 +59,10 @@ seeds = (2, 3, 4, 5, 6)
 n_samples = 30
 ambient_dim = 64
 delta = 3.0
-r_inner = 0.6
+r_inner = 1.5
 num_noisy = 250
-n_pretrain = 400
-n_projection = 1200
-lr_pretrain = 2e-3
-lr_projection = 1e-3
+n_pretrain = 700
+n_projection = 10000
 metric_every = 200
 loss_chunk_size = 256  # Accumulate the full objective before each Adam update.
 n_diffusion = 50000
@@ -80,6 +79,12 @@ projection_specs = {
     "small": {"widths": (100, 200, 100), "residual": False},
     "medium": {"widths": (256,) * 4, "residual": True},
     "large": {"widths": (512,) * 8, "residual": True},
+}
+projection_schedules = {
+    "tiny": {"lr_pretrain": 2e-3, "lr_projection": 1e-3},
+    "small": {"lr_pretrain": 2e-3, "lr_projection": 8e-4},
+    "medium": {"lr_pretrain": 1e-3, "lr_projection": 4e-4},
+    "large": {"lr_pretrain": 5e-4, "lr_projection": 5e-5},
 }
 score_specs = {
     "tiny": {"hidden_dims": (64, 128, 64), "embed_dim": 64},
@@ -211,6 +216,7 @@ def run_capacity_model(method, architecture, seed, evaluation, device):
     marginal_std, _ = make_sde_fns(sigma)
     if method == "projection":
         spec = projection_specs[architecture]
+        schedule = projection_schedules[architecture]
         widths = spec["widths"]
         if not spec["residual"] and len(widths) == 3 and widths[0] == widths[2]:
             model = ProjectionNet(ambient_dim, hidden=widths[0], mid=widths[1])
@@ -246,7 +252,8 @@ def run_capacity_model(method, architecture, seed, evaluation, device):
         train_projection_algorithm1(
             model, evaluation.samples, delta,
             n_pretrain=n_pretrain, n_project=n_projection,
-            lr_pretrain=lr_pretrain, lr_project=lr_projection,
+            lr_pretrain=schedule["lr_pretrain"],
+            lr_project=schedule["lr_projection"],
             num_noisy=num_noisy, r_inner=r_inner,
             loss_pretrain={"C1": 1, "C3": 1},
             loss_project={"C1": 1, "C2": 1, "C3": 1},
@@ -280,7 +287,7 @@ def run_capacity_model(method, architecture, seed, evaluation, device):
 def training_config():
     """Reject cached results from a different objective or training budget."""
     names = ("n_samples", "ambient_dim", "delta", "r_inner", "num_noisy", "n_pretrain",
-             "n_projection", "lr_pretrain", "lr_projection", "n_diffusion",
+             "n_projection", "projection_schedules", "n_diffusion",
              "lr_diffusion", "diffusion_time_samples", "sigma", "num_generated",
              "diffusion_num_steps", "metric_every", "diffusion_metric_every",
              "loss_chunk_size", "projection_specs", "score_specs")
