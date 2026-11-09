@@ -71,21 +71,15 @@ Keep the supplied folder structure, data splits, and cached results together wit
 ### Use Cached Results
 
 After installing the package and downloading `trained_models/`, run an
-experiment script from the repository root:
+experiment script from the repository root. For example:
 
 ```bash
 python3 experiments/01_2d_circle.py --no-show
-python3 experiments/02_k_torus.py
 python3 experiments/03_torus_1d_images.py
-python3 experiments/04_torus_circle_union.py
-python3 experiments/05_torus_256d.py
-python3 experiments/06_mnist_multiseed.py --no-show
 python3 experiments/07_capacity_sweep.py --report-only
 ```
 
 With the complete checkpoint folder, these commands load saved models or metrics without retraining. Some scripts start training if required checkpoints are missing. Set `MPLBACKEND=Agg` to save figures without opening plot windows.
-
-Experiment 02 displays the historical cached paper results by default. Its scaled-256D checkpoints are replacement runs with the same settings; the original scaled-256D weights were not saved. Use `python3 experiments/02_k_torus.py --evaluate-checkpoints` to evaluate the supplied weights, whose MIE values differ from the historical paper results.
 
 ### Train From Scratch
 
