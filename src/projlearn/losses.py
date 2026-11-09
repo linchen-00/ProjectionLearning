@@ -31,7 +31,8 @@ def projection_loss(model, samples, smoothed_samples, smooth_output,
             rather than the nearest point in the current mini-batch.
         c2_balance: s in C2 = w2 * (s*A + (1-s)*B), where A and B are
             mean squared JVP norms at T(x) and x, respectively. The trainer
-            starts at 0.5 and balances the observed epoch means afterward.
+            defaults to adaptive balancing; it can also hold s fixed at 1
+            to use only the original output-point term A.
             This function uses the supplied s; it does not update s itself.
         return_c2_terms: append detached, unweighted (A, B) to the result
             for the trainer's epoch-level balancing update. This only changes
@@ -69,21 +70,24 @@ def projection_loss(model, samples, smoothed_samples, smooth_output,
             idx = torch.randperm(len(v), device=v.device)[:k]
             eval_output, eval_input, v = eval_output[idx], eval_input[idx], v[idx]
 
-        if c2_mode == "fd":
-            Jv_output = (model(eval_output + c2_fd_eps * v)
-                         - model(eval_output)) / c2_fd_eps
-            Jv_input = (model(eval_input + c2_fd_eps * v)
-                        - model(eval_input)) / c2_fd_eps
-        else:
-            def Jv_product(x, v):
-                _, Jv = jvp(model, (x,), (v,))
-                return Jv
+        def squared_jvp(eval_point):
+            if c2_mode == "fd":
+                Jv = (model(eval_point + c2_fd_eps * v)
+                      - model(eval_point)) / c2_fd_eps
+            else:
+                def Jv_product(x, direction):
+                    _, Jv = jvp(model, (x,), (direction,))
+                    return Jv
 
-            Jv_output = vmap(Jv_product)(eval_output, v)
-            Jv_input = vmap(Jv_product)(eval_input, v)
+                Jv = vmap(Jv_product)(eval_point, v)
+            return Jv.square().sum(dim=-1).mean()
 
-        c2_at_output = Jv_output.square().sum(dim=-1).mean()
-        c2_at_input = Jv_input.square().sum(dim=-1).mean()
+        # Fixed endpoint weights need only one JVP. Diagnostics explicitly
+        # requesting both residuals still receive both A and B.
+        if c2_balance > 0 or return_c2_terms:
+            c2_at_output = squared_jvp(eval_output)
+        if c2_balance < 1 or return_c2_terms:
+            c2_at_input = squared_jvp(eval_input)
         C2 = w["C2"] * (c2_balance * c2_at_output
                         + (1 - c2_balance) * c2_at_input)
 

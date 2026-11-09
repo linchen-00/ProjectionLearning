@@ -30,6 +30,7 @@ import argparse
 import copy
 import itertools
 import time
+import warnings
 from pathlib import Path
 
 import psutil
@@ -57,7 +58,6 @@ from projlearn.visualization import plot_3d, plot_3d_with_lines
 root = Path(__file__).resolve().parent.parent
 save_root = root / "trained_models" / "05_torus_256d"
 wasserstein_metrics = [
-    "W(orig,orig)",
     "W(true,true)",
     "W(gen,true)",
     "W(orig,true)",
@@ -89,12 +89,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--wasserstein-subsample", type=int, default=5000,
+        "--wasserstein-subsample", type=int, default=24000,
         help=(
             "Maximum generated/true points per set for local Wasserstein "
-            "recomputation. Original sample sets remain at N=480."
+            "recomputation (paper: 24000). Training sets remain at N=480."
         ),
     )
+    parser.add_argument("--wasserstein-max-iter", type=int, default=10_000_000,
+                        help="EMD solver iteration limit; unconverged solves fail.")
     return parser.parse_args()
 
 
@@ -234,8 +236,8 @@ def main():
         )
         add_wasserstein_summary(wass_data, lines)
     elif args.force_recompute_wasserstein:
-        if args.wasserstein_subsample <= 0:
-            raise ValueError("--wasserstein-subsample must be positive")
+        if args.wasserstein_subsample <= 0 or args.wasserstein_max_iter <= 0:
+            raise ValueError("Wasserstein point and iteration limits must be positive")
         try:
             ram_gb = psutil.virtual_memory().total / 1024**3
             if ram_gb < 8:
@@ -253,10 +255,6 @@ def main():
                     seed + 10_000,
                 )
                 sets[f"original_s{seed}"] = samples_by_seed[seed].cpu()
-                sets[f"original_ref_s{seed}"] = sample_torus_reference(
-                    samples_by_seed[seed].shape[0], 30_000 + seed
-                )
-
                 n_total = sets[f"generated_s{seed}"].shape[0]
                 sets[f"true_s{seed}"] = sample_torus_reference(
                     n_total, 40_000 + seed
@@ -266,7 +264,7 @@ def main():
                 )
 
             results_W, per_seed_results, summary = compute_wasserstein_per_seed(
-                sets, seeds
+                sets, seeds, max_iter=args.wasserstein_max_iter
             )
 
             torch.save(
@@ -280,6 +278,9 @@ def main():
                         "full_generated_points_per_seed": int(
                             generated_by_seed[seeds[0]].shape[0]
                         ),
+                        "numItermax": args.wasserstein_max_iter,
+                        "all_paper_pairs_converged": True,
+                        "applications": args.applications,
                     },
                 },
                 wass_ckpt_path,
@@ -442,7 +443,7 @@ def sample_torus_reference(num_points, seed):
     ).cpu()
 
 
-def compute_wasserstein_per_seed(sets, seeds):
+def compute_wasserstein_per_seed(sets, seeds, max_iter=10_000_000):
     import ot
 
     results_W = {}
@@ -456,8 +457,17 @@ def compute_wasserstein_per_seed(sets, seeds):
         Xj = np.array(sets[name_b])
         ai = np.ones(Xi.shape[0]) / Xi.shape[0]
         aj = np.ones(Xj.shape[0]) / Xj.shape[0]
-        cost = ot.dist(Xi, Xj, metric="euclidean")
-        value = ot.emd2(ai, aj, cost)
+        cost = np.asarray(ot.dist(Xi, Xj, metric="euclidean"),
+                          dtype=np.float64, order="C")
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            value, log = ot.emd2(ai, aj, cost, numItermax=max_iter,
+                                 numThreads=1, log=True)
+        if (log["result_code"] != 1 or log.get("warning") is not None
+                or captured or not np.isfinite(value)):
+            raise RuntimeError(f"W1 solve did not converge: {name_a}, {name_b}; "
+                               f"solver log={log}, warnings="
+                               f"{[str(w.message) for w in captured]}")
         results_W[(name_a, name_b)] = value
         del cost
         return value
@@ -465,9 +475,6 @@ def compute_wasserstein_per_seed(sets, seeds):
     per_seed_results = {}
     for seed in seeds:
         per_seed_results[seed] = {
-            "W(orig,orig)": compute_pair(
-                f"original_s{seed}", f"original_ref_s{seed}"
-            ),
             "W(true,true)": compute_pair(
                 f"true_s{seed}", f"true_ref_s{seed}"
             ),

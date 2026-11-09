@@ -21,6 +21,8 @@ Run with:
 
 Flag:
 ``--force-train`` to ignore cached checkpoints and retrain from scratch
+``--evaluate-checkpoints`` to evaluate the saved native and scaled-256D
+models without training or replacing the historical paper result caches.
 """
 
 import argparse
@@ -85,7 +87,13 @@ def parse_args():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--force-train", action="store_true",
                     help="Retrain from scratch even if checkpoints exist.")
-    return ap.parse_args()
+    ap.add_argument("--evaluate-checkpoints", action="store_true",
+                    help="Evaluate saved native/scaled models without training; "
+                         "leave historical result caches unchanged.")
+    args = ap.parse_args()
+    if args.force_train and args.evaluate_checkpoints:
+        ap.error("--force-train and --evaluate-checkpoints cannot be combined")
+    return args
 
 
 # ── Training helper ───────────────────────────────────────────────────────────
@@ -105,6 +113,7 @@ def train_torus_model(n, delta, ambient_dim, sampler=None, use_dataloader=False)
         loss_project={"C1": 1, "C2": 0.5, "C3": 0.5},
         scheduler_pretrain="constant", scheduler_project="constant",
         batch_size=batch_size, use_dataloader=use_dataloader,
+        c2_balance=1.0,  # Paper protocol: original C2, fixed s=1.
         show_progress=True, verbose=False, device=device,
     )
 
@@ -114,6 +123,76 @@ def train_torus_model(n, delta, ambient_dim, sampler=None, use_dataloader=False)
     with torch.no_grad():
         manifold = model_cpu(model_cpu(M_delta))
     return samples.cpu(), manifold.cpu(), model_cpu
+
+
+def load_torus_checkpoint(d, *, embedded=False):
+    """Load saved weights and anchors; never train or substitute metric caches.
+
+    The scaled checkpoints are replacement runs at the paper settings,
+    not the unavailable weights that produced the historical paper numbers.
+    """
+    if embedded:
+        path = save_dir / f"torus_scaled_d{d}.pt"
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        state = (checkpoint["model_state_dict"] if "model_state_dict" in checkpoint
+                 else checkpoint["state_dict"])
+        samples = checkpoint["samples"].cpu()
+        ambient = 256
+    else:
+        path = save_dir / f"torus_d{d}.pt"
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        progress = torch.load(save_dir / "checkpoint.pt", map_location="cpu",
+                              weights_only=False)
+        n = progress["results_min_n"][torus_dims.index(d)]
+        # Original native checkpoints contain bare weights. Their anchors
+        # are regenerated using the original data sampler and seed.
+        with torch.random.fork_rng():
+            torch.manual_seed(3)
+            samples = torus(n, ambient_dim=2*d).cpu()
+        ambient = 2*d
+    model = ProjectionNet(ambient)
+    model.load_state_dict(state, strict=True)
+    return model.eval(), samples
+
+
+@torch.no_grad()
+def evaluate_checkpoints():
+    """Fresh MIE from saved weights, separate from historical paper metrics."""
+    rows = []
+    for d in torus_dims:
+        row = {"d": d}
+        for embedded, label in ((False, "native"), (True, "scaled256")):
+            model, samples = load_torus_checkpoint(d, embedded=embedded)
+            ambient = 256 if embedded else 2*d
+            delta = 16/math.sqrt(d) if embedded else 1.0
+            noisy = tubular_nbh(samples, delta, ambient,
+                                num_points_per_sample=num_noisy, seed=3)
+            generated = model(model(noisy))
+            mie, _ = dist_torus_embedded(
+                generated, torus_dim=d, ambient_dim=ambient,
+                threshold=mie_threshold)
+            row[label] = float(mie)
+        rows.append(row)
+    print("Fresh saved-model evaluation (two applications of T).")
+    print("Scaled models are replacement runs; these are not the historical paper MIEs.")
+    print(" d       native MIE    scaled-256D MIE")
+    for row in rows:
+        print(f" {row['d']}       {row['native']:.6f}          {row['scaled256']:.6f}")
+    return rows
+
+
+def save_embedded_checkpoint(d, samples, model, delta, *, scaled):
+    """Keep embedded weights as well as metrics for future runs."""
+    name = f"torus_{'scaled' if scaled else 'delta1'}_d{d}.pt"
+    torch.save({
+        "model_state_dict": model.state_dict(), "samples": samples.cpu(),
+        "config": {"d": d, "n": len(samples), "ambient_dim": 256,
+                   "delta": delta, "r_inner": delta/2, "seed": 3,
+                   "c2_balance": 1.0, "n_pretrain": n_pretrain,
+                   "n_projection": n_projection, "lr_pretrain": lr_pretrain,
+                   "lr_projection": lr_projection, "num_noisy": num_noisy,
+                   "batch_size": batch_size, "evaluation_applications": 2},
+    }, save_dir / name)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -266,6 +345,8 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
 
         missing = [d for d in torus_dims if d not in partb_completed]
         if not missing:
+            print("Reporting historical cached metrics. Use --evaluate-checkpoints "
+                  "for fresh MIE from the saved replacement scaled models.")
             _print_partB_table(partb_results, results_min_n)
             _save_partB_artifacts(partb_results)
             return partb_results
@@ -299,8 +380,9 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
 
         # ── delta = 1 ─────────────────────────────────────────────────────────
         print("  Training delta=1 ...")
-        _, manifold_1, _ = train_torus_model(
+        samples_1, manifold_1, model_1 = train_torus_model(
             n_star, 1.0, ambient_256, sampler=sampler_256, use_dataloader=True)
+        save_embedded_checkpoint(d, samples_1, model_1, 1.0, scaled=False)
         d1_amb_mie, d1_amb_pass = dist_torus_embedded(
             manifold_1, torus_dim=d, ambient_dim=ambient_256,
             threshold=mie_threshold)
@@ -309,14 +391,15 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
             threshold=mie_threshold)
         print(f"    amb MIE={d1_amb_mie:.6f} ({'PASS' if d1_amb_pass else 'FAIL'}), "
               f"emb MIE={d1_emb_mie:.6f}")
-        del manifold_1
+        del manifold_1, samples_1, model_1
         gc.collect()
 
         # ── delta = 16/sqrt(d) ────────────────────────────────────────────────
         print(f"  Training delta=16/sqrt({d})={delta_scaled:.4f} ...")
-        _, manifold_2, _ = train_torus_model(
+        samples_2, manifold_2, model_2 = train_torus_model(
             n_star, delta_scaled, ambient_256,
             sampler=sampler_256, use_dataloader=True)
+        save_embedded_checkpoint(d, samples_2, model_2, delta_scaled, scaled=True)
         ds_amb_mie, ds_amb_pass = dist_torus_embedded(
             manifold_2, torus_dim=d, ambient_dim=ambient_256,
             threshold=mie_threshold)
@@ -325,7 +408,7 @@ def run_partB(results_min_n: list, force_train: bool) -> dict:
             threshold=mie_threshold)
         print(f"    amb MIE={ds_amb_mie:.6f} ({'PASS' if ds_amb_pass else 'FAIL'}), "
               f"emb MIE={ds_emb_mie:.6f}")
-        del manifold_2
+        del manifold_2, samples_2, model_2
         gc.collect()
 
         partb_results[d] = {
@@ -401,6 +484,8 @@ def _save_partB_artifacts(partb_results: dict) -> None:
 
 def main():
     args = parse_args()
+    if args.evaluate_checkpoints:
+        return evaluate_checkpoints()
     save_dir.mkdir(parents=True, exist_ok=True)
 
     results_min_n, all_trials = run_partA(args.force_train)

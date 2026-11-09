@@ -4,6 +4,7 @@ import copy
 import time
 import torch
 import os
+from numbers import Real
 from dataclasses import dataclass, field
 from tqdm import trange
 from torch.utils.data import DataLoader
@@ -85,7 +86,7 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
                      c2_fd_eps=1e-3,
                      save_dir=None, save_every_epochs=50, save_prefix="model",
                      epoch_callback=None, metric_every=0,
-                     loss_chunk_size=None):
+                     loss_chunk_size=None, c2_balance="adaptive"):
     """Train a projection model.
 
     Args:
@@ -99,10 +100,13 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
         batch_size: batch size when using dataloader mode
         loss_weights: dict like {"C1": 1, "C2": 0.5, "C3": 0.5}; defaults to {"C1": 1, "C3": 1}
         r_inner: inner radius for C3 term
-        c2_mode: "exact", "subsample", or "fd". C2 blends the mean squared
-            JVP norms A at T(x) and B at x. Each phase starts with s=0.5;
-            after each epoch, s=B/(A+B) using detached, sample-weighted
-            epoch means for the next epoch. If A=B=0, s stays at 0.5.
+        c2_mode: "exact", "subsample", or "fd" for computing JVPs.
+        c2_balance: "adaptive" (default), or a fixed number s in [0, 1].
+            C2 blends the mean squared JVP norms as s*A+(1-s)*B, with A
+            evaluated at T(x) and B at x. Adaptive training starts at 0.5
+            and uses detached, sample-weighted epoch means to set
+            s=B/(A+B) for the next epoch (0.5 when A=B=0). Set 1.0 for
+            the original C2 objective A throughout training.
         lr: learning rate
         print_every: update tqdm description every this many iterations
         use_dataloader: if True, batch via DataLoader (for large datasets)
@@ -154,6 +158,11 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
     """
     if loss_weights is None:
         loss_weights = {"C1": 1, "C3": 1}
+    adaptive_c2 = isinstance(c2_balance, str) and c2_balance == "adaptive"
+    if not adaptive_c2 and (
+            not isinstance(c2_balance, Real) or not 0 <= c2_balance <= 1):
+        raise ValueError('c2_balance must be "adaptive" or a number in [0, 1]')
+    current_c2_balance = 0.5 if adaptive_c2 else float(c2_balance)
     if device is None:
         device = next(model.parameters()).device
     if loss_chunk_size is not None and (
@@ -168,7 +177,6 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
     lr_scheduler = _make_scheduler(optimizer, n_epochs, scheduler)
     iterator = trange(n_epochs, disable=not show_progress)
     loss_history = []
-    c2_balance = 0.5
     t0 = time.time()
 
     if save_dir is not None:
@@ -177,13 +185,17 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
     def backward_loss(batch, smoothed):
         """Backpropagate one batch, optionally accumulating noisy-point chunks."""
         def compute_loss(points):
-            return projection_loss(
+            result = projection_loss(
                 model, batch, points, model(points), loss_weights, r_inner,
                 delta=delta, c2_mode=c2_mode,
                 c2_subsample=c2_subsample, c2_fd_eps=c2_fd_eps,
-                all_samples=samples_dev, c2_balance=c2_balance,
-                return_c2_terms=True,
+                all_samples=samples_dev, c2_balance=current_c2_balance,
+                return_c2_terms=adaptive_c2,
             )
+            if adaptive_c2:
+                return result
+            zero = points.new_zeros(())
+            return (*result, zero, zero)
 
         if loss_chunk_size is None:
             loss, _, _, _, _, c2_a, c2_b = compute_loss(smoothed)
@@ -215,8 +227,10 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
                 total_loss, c2_a, c2_b = backward_loss(batch, smoothed)
                 c2_epoch += torch.stack((c2_a, c2_b)) * len(smoothed)
                 optimizer.step()
-            c2_sum = c2_epoch.sum().item()
-            c2_balance = (c2_epoch[1].item() / c2_sum) if c2_sum > 0 else 0.5
+            if adaptive_c2:
+                c2_sum = c2_epoch.sum().item()
+                current_c2_balance = (
+                    c2_epoch[1].item() / c2_sum if c2_sum > 0 else 0.5)
             loss_history.append(total_loss.item())
             if lr_scheduler:
                 lr_scheduler.step()
@@ -239,6 +253,8 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
                             if lr_scheduler is not None else None
                         ),
                         "loss": total_loss.item(),
+                        "c2_balance_policy": c2_balance,
+                        "c2_balance_next": current_c2_balance,
                     },
                     ckpt_path,
                 )
@@ -264,8 +280,9 @@ def train_projection(model, samples, delta, n_epochs=400, num_noisy=50,
 
             total_loss, c2_a, c2_b = backward_loss(batch, smoothed)
             optimizer.step()
-            c2_sum = (c2_a + c2_b).item()
-            c2_balance = (c2_b.item() / c2_sum) if c2_sum > 0 else 0.5
+            if adaptive_c2:
+                c2_sum = (c2_a + c2_b).item()
+                current_c2_balance = c2_b.item() / c2_sum if c2_sum > 0 else 0.5
             loss_history.append(total_loss.item())
             if lr_scheduler:
                 lr_scheduler.step()
@@ -422,6 +439,7 @@ def train_projection_algorithm1(
     epoch_callback=None,
     metric_every=0,
     loss_chunk_size=None,
+    c2_balance="adaptive",
 ):
     """Algorithm 1 — Two-Stage Training of the Projection Model.
 
@@ -462,6 +480,8 @@ def train_projection_algorithm1(
         n_pre: legacy absolute-count refined-anchor budget (used only when
             ``prev_copies`` is None).
         c2_mode, c2_subsample, c2_fd_eps: forwarded to ``projection_loss``.
+        c2_balance: "adaptive" (default), or a fixed s in [0, 1]; use 1.0
+            for original C2. Forwarded to both training phases.
         loss_chunk_size: optional noisy-point chunk size forwarded to
             ``train_projection``; gradients accumulate before each Adam step.
         save_dir, save_every_epochs, save_prefix: optional periodic-checkpoint
@@ -509,6 +529,7 @@ def train_projection_algorithm1(
         c2_fd_eps=c2_fd_eps,
         metric_every=metric_every,
         loss_chunk_size=loss_chunk_size,
+        c2_balance=c2_balance,
     )
 
     save_pre = {}
@@ -587,6 +608,7 @@ def train_projection_algorithm2(
     save_prefix="alg2",
     epoch_callback=None,
     metric_every=0,
+    c2_balance="adaptive",
 ):
     """Algorithm 2 — Iterated Projection Algorithm (IPA).
 
@@ -638,6 +660,8 @@ def train_projection_algorithm2(
             documented for :func:`train_projection`, plus ``"phase"``
             (``"pretrain"`` / ``"project"``) and ``"stage"`` (0-based).
         metric_every: epoch-frequency for ``epoch_callback``.
+        c2_balance: "adaptive" (default), or a fixed s in [0, 1], forwarded
+            to every stage. Use 1.0 for the original MNIST objective.
 
     Returns:
         dict with keys ``model`` (final, after stage K),
@@ -723,6 +747,7 @@ def train_projection_algorithm2(
             pre_model=prev_model, prev_delta=prev_delta,
             prev_copies=prev_copies_k,
             c2_mode=c2_mode, c2_subsample=c2_subsample, c2_fd_eps=c2_fd_eps,
+            c2_balance=c2_balance,
             save_dir=save_dir, save_every_epochs=save_every_epochs,
             save_prefix=f"{save_prefix}_stage{k}",
             epoch_callback=(_stage_cb if epoch_callback is not None else None),

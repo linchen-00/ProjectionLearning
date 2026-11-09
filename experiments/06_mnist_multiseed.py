@@ -244,6 +244,7 @@ def _train_projection_cascade(seed: int, train_flat: torch.Tensor,
         print_every=20, show_progress=True, device=device,
         save_dir=str(seed_dir), save_every_epochs=save_every,
         save_prefix="alg2",
+        c2_balance=1.0,  # Paper protocol: original C2 at every cascade stage.
     )
     print(f"  [DONE proj cascade]   seed={seed}")
     interleaved = []
@@ -285,9 +286,11 @@ def _train_diffusion_score_and_sample(seed: int, train_flat: torch.Tensor,
 
 def _sample_diffusion_from_checkpoint(seed: int, n_total: int,
                                       seed_dir: Path) -> torch.Tensor | None:
-    """Load ``diff_model.pt`` and run the PC sampler, if the checkpoint exists."""
-    ckpt_path = seed_dir / "diff_model.pt"
-    if not ckpt_path.exists():
+    """Load historical or newly trained diffusion weights and run the PC sampler."""
+    ckpt_path = next((seed_dir / name for name in
+                      ("score_model.pth", "diff_model.pt")
+                      if (seed_dir / name).exists()), None)
+    if ckpt_path is None:
         return None
 
     print(f"  [DIFFUSION] seed{seed}: sampling from {ckpt_path.name}")
