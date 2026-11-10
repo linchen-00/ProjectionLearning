@@ -135,7 +135,6 @@ The second application is optional, but it can further refine samples because a 
 - Algorithm 1 trains a projection map at a single noise radius. It is a good default for low-dimensional manifolds and simple experiments.
 - For models trained with Algorithm 1, applying the learned projection map a small number of times can improve sampling quality.
 - Algorithm 2 trains projection maps across decreasing noise radii, giving a coarse-to-fine projection procedure. It is recommended for high-dimensional data such as images.
-- Experiments 01, 03–05, and 07 use the adaptive C2 loss for projection training (`c2_balance="adaptive"`, the default). It combines mean squared Jacobian-vector penalties at `T(x)` and `x`, starting with equal weights and rebalancing them after each epoch. Experiments 02 and 06 use the original C2 term with fixed `s=1` (`c2_balance=1.0`). Both algorithm wrappers accept this choice.
 - If the Jacobian-vector penalty in the objective is expensive, use `c2_mode="fd"` for a finite-difference approximation or `c2_mode="subsample"` to evaluate on the random subset. Use `c2_mode="exact"` for exact Jacobian-vector products on the full batch.
 - If a noisy batch does not fit in memory, set `loss_chunk_size` to process its points in smaller groups while keeping one optimizer update per batch.
 
